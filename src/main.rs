@@ -549,6 +549,17 @@ async fn run_trading_cycle_single_market(
         );
     }
 
+    // BUG FIX: Also check DOWN price safe range
+    if down_price < trading_config.safe_range_low {
+        price_warning_tracker.write().await.log_price_warning(
+            down_price, "below", trading_config.safe_range_low, trading_config.safe_range_high, "DOWN"
+        );
+    } else if down_price > trading_config.safe_range_high {
+        price_warning_tracker.write().await.log_price_warning(
+            down_price, "above", trading_config.safe_range_low, trading_config.safe_range_high, "DOWN"
+        );
+    }
+
     // CRITICAL FIX: Check for fills BEFORE cancelling to avoid double-counting
     // Step 1: Get tracked order IDs for both tokens
     let tracked_orders_up: Vec<String> = {
