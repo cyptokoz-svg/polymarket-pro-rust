@@ -960,10 +960,14 @@ async fn place_side_order(
         }
         Ok(None) => {
             info!("⚠️ Order validation failed for {} {:?} @ {}", outcome, side, price);
+            // Return error to stop trading cycle - partial fills can cause imbalance
+            return Err(format!("Order validation failed for {} {:?}", outcome, side).into());
         }
         Err(e) => {
-            error!("{:?} order failed: {}", side, e);
+            error!("❌ {:?} order failed: {}", side, e);
             stats.write().await.record_error();
+            // Return error to stop trading cycle - partial fills can cause imbalance
+            return Err(format!("Order placement failed: {}", e).into());
         }
     }
     Ok(())
