@@ -793,17 +793,21 @@ async fn run_trading_cycle_single_market(
     let spread = trading_config.spread;
     
     // Adjust prices based on inventory skew
-    // Positive skew = more UP, so we want to sell UP cheaper and buy DOWN cheaper
-    // Negative skew = more DOWN, so we want to sell DOWN cheaper and buy UP cheaper
+    // Positive skew = more UP, so we want to:
+    //   - Lower UP bid (buy less UP)
+    //   - Lower UP ask (sell UP cheaper)
+    //   - Lower DOWN bid (buy more DOWN)
+    //   - Lower DOWN ask (sell DOWN cheaper)
+    // Negative skew = more DOWN, opposite adjustments
     let skew_adjustment = inventory_skew * 0.01; // 1% adjustment per unit of skew
     
-    // UP token prices
+    // UP token prices - both bid and ask move with skew
     let up_bid_price = (up_price - spread / 2.0 - skew_adjustment).max(trading_config.safe_range_low).min(trading_config.safe_range_high);
     let up_ask_price = (up_price + spread / 2.0 - skew_adjustment).max(trading_config.safe_range_low).min(trading_config.safe_range_high);
     
-    // DOWN token prices
-    let down_bid_price = (down_price - spread / 2.0 + skew_adjustment).max(trading_config.safe_range_low).min(trading_config.safe_range_high);
-    let down_ask_price = (down_price + spread / 2.0 + skew_adjustment).max(trading_config.safe_range_low).min(trading_config.safe_range_high);
+    // DOWN token prices - both bid and ask move with skew (same direction as UP)
+    let down_bid_price = (down_price - spread / 2.0 - skew_adjustment).max(trading_config.safe_range_low).min(trading_config.safe_range_high);
+    let down_ask_price = (down_price + spread / 2.0 - skew_adjustment).max(trading_config.safe_range_low).min(trading_config.safe_range_high);
 
     info!("💰 Order prices - UP: bid={:.4}, ask={:.4} | DOWN: bid={:.4}, ask={:.4}",
         up_bid_price, up_ask_price, down_bid_price, down_ask_price);
