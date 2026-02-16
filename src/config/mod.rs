@@ -75,6 +75,8 @@ pub struct TradingConfig {
     pub refresh_interval: u64,
     /// Spread percentage (default: 0.02)
     pub spread: f64,
+    /// Trading strategy mode: "market_maker" (4 orders) or "buy_hold" (2 orders)
+    pub strategy_mode: String,
 }
 
 /// WebSocket configuration
@@ -118,6 +120,7 @@ impl Default for Config {
                 price_warn_cooldown: 60,   // New: price warning cooldown in seconds
                 refresh_interval: 45,
                 spread: 0.02,
+                strategy_mode: "market_maker".to_string(), // "market_maker" or "buy_hold"
             },
             websocket: WebSocketConfig {
                 enabled: true,
@@ -380,6 +383,9 @@ pub fn from_env() -> anyhow::Result<Config> {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0.02),
+            strategy_mode: env::var("STRATEGY_MODE")
+                .ok()
+                .unwrap_or_else(|| "buy_hold".to_string()),
         },
         websocket: WebSocketConfig {
             enabled: env::var("WS_ENABLED")

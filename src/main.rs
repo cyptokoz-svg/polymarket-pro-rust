@@ -3,6 +3,7 @@
 //! 支持配置文件: polymarket-pro.toml, polymarket-pro.yaml, config.toml
 
 use anyhow::Result;
+use futures::FutureExt;
 use polymarket_pro::*;
 use polymarket_pro::api::Side;
 use polymarket_pro::trading::PriceWarningTracker;
@@ -18,6 +19,24 @@ use btc_market::{find_btc_5min_market, get_market_token_ids};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Set up panic hook to log panics
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("🛑 PANIC: {}", info);
+        eprintln!("{}", msg);
+        // Also try to write to a crash log file
+        let _ = std::fs::write("/tmp/polymarket-pro-crash.log", msg);
+    }));
+    
+    // Set up custom panic hook for tokio
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info.location().map(|l| format!("{}:{}", l.file(), l.line())).unwrap_or_else(|| "unknown".to_string());
+        let msg = format!("🛑 PANIC at {}: {}", location, info);
+        eprintln!("{}", msg);
+        let _ = std::fs::write("/tmp/polymarket-pro-crash.log", format!("{}\n", msg));
+        default_panic(info);
+    }));
+    
     let config = load_config().await?;
 
     let log_level = config.log_level.as_deref().unwrap_or("info");
@@ -168,6 +187,9 @@ async fn main() -> Result<()> {
         }
     }
     
+    // Flag to skip first trading cycle to allow WebSocket to connect
+    let mut first_cycle = true;
+    
     loop {
         tokio::select! {
             // Check for new market periodically
@@ -191,8 +213,14 @@ async fn main() -> Result<()> {
                 
                 if need_new_market {
                     info!("🔍 Looking for BTC updown 5m market...");
-                    match find_btc_5min_market(&executor).await {
-                        Some(new_market) => {
+                    
+                    // Wrap market finding in panic catcher
+                    let market_result = std::panic::AssertUnwindSafe(async {
+                        find_btc_5min_market(&executor).await
+                    }).catch_unwind().await;
+                    
+                    match market_result {
+                        Ok(Some(new_market)) => {
                             let new_condition_id = new_market.get("conditionId").and_then(|v| v.as_str()).unwrap_or("").to_string();
                             let old_condition_id = current_market.as_ref().map(|m| m.condition_id.clone());
                             
@@ -232,8 +260,11 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
-                        None => {
+                        Ok(None) => {
                             warn!("⚠️ No 5-minute market found");
+                        }
+                        Err(_) => {
+                            error!("🛑 Panic caught while finding new market, continuing...");
                         }
                     }
                 }
@@ -264,6 +295,13 @@ async fn main() -> Result<()> {
                         
                         info!("⏰ Trading on 5-minute market, expires in {}s", time_to_expiry);
                     }
+                }
+                
+                // Skip first cycle to allow WebSocket to connect and receive prices
+                if first_cycle {
+                    info!("⏳ Skipping first trading cycle to allow WebSocket initialization...");
+                    first_cycle = false;
+                    continue;
                 }
                 
                 // Apply rate limiting
@@ -405,10 +443,12 @@ async fn subscribe_to_market_ws(
                 let token_ids = vec![up_token.clone(), down_token.clone()];
                 ws.update_subscription(token_ids).await;
                 
-                // Set token labels
+                // Set token labels - use FIRST 20 chars to match Gamma API behavior
                 let mut labels = std::collections::HashMap::new();
-                labels.insert(up_token.clone(), "UP".to_string());
-                labels.insert(down_token.clone(), "DOWN".to_string());
+                let up_short = &up_token[..20.min(up_token.len())];
+                let down_short = &down_token[..20.min(down_token.len())];
+                labels.insert(up_short.to_string(), "UP".to_string());
+                labels.insert(down_short.to_string(), "DOWN".to_string());
                 ws.set_token_labels(labels).await;
                 
                 info!("✅ WebSocket subscription updated successfully");
@@ -460,6 +500,44 @@ async fn run_trading_cycle_single_market(
     order_tracker: Arc<RwLock<OrderTracker>>,
     trade_history: Arc<TradeHistory>,
     stats: Arc<RwLock<TradingStats>>,
+    price_freshness: Arc<RwLock<PriceFreshness>>,
+    price_warning_tracker: Arc<RwLock<PriceWarningTracker>>,
+    trading_config: &TradingConfig,
+    market_info: &MarketInfo,
+) -> Result<()> {
+    // Wrap the actual implementation with panic catching
+    let result = std::panic::AssertUnwindSafe(run_trading_cycle_single_market_inner(
+        executor,
+        ws,
+        position_tracker,
+        order_tracker,
+        trade_history,
+        stats,
+        price_freshness,
+        price_warning_tracker,
+        trading_config,
+        market_info,
+    )).catch_unwind().await;
+    
+    match result {
+        Ok(inner_result) => inner_result,
+        Err(_) => {
+            error!("🛑 PANIC caught in trading cycle! This is a bug.");
+            // Return error to stop the cycle gracefully
+            Err(anyhow::anyhow!("Trading cycle panicked"))
+        }
+    }
+}
+
+/// Inner implementation of trading cycle
+#[allow(clippy::too_many_arguments)]
+async fn run_trading_cycle_single_market_inner(
+    executor: Arc<TradeExecutor>,
+    ws: Option<Arc<PolymarketWebSocket>>,
+    position_tracker: Arc<RwLock<PositionTracker>>,
+    order_tracker: Arc<RwLock<OrderTracker>>,
+    trade_history: Arc<TradeHistory>,
+    stats: Arc<RwLock<TradingStats>>,
     _price_freshness: Arc<RwLock<PriceFreshness>>,
     price_warning_tracker: Arc<RwLock<PriceWarningTracker>>,
     trading_config: &TradingConfig,
@@ -472,17 +550,24 @@ async fn run_trading_cycle_single_market(
     let up_token_id = market_info.up_token.clone();
     let down_token_id = market_info.down_token.clone();
     
-    // Check WebSocket price freshness
-    let ws_fresh = if let Some(ref ws) = ws {
-        let prices = ws.get_all_prices().await;
-        !prices.is_empty()
-    } else {
-        false
-    };
+    // DEBUG: Print token IDs
+    info!("DEBUG: up_token_id length: {}, value: {}", up_token_id.len(), &up_token_id[..up_token_id.len().min(30)]);
+    info!("DEBUG: down_token_id length: {}, value: {}", down_token_id.len(), &down_token_id[..down_token_id.len().min(30)]);
     
-    if !ws_fresh {
-        warn!("⚠️ WebSocket prices may be stale");
-    }
+    // Check WebSocket prices - if not available, skip this cycle (non-blocking)
+    let ws_prices_available = if let Some(ref ws) = ws {
+        let prices = ws.get_all_prices().await;
+        if !prices.is_empty() {
+            info!("✅ WebSocket prices available: {} tokens", prices.len());
+            true
+        } else {
+            warn!("⚠️ WebSocket prices not available, skipping trading cycle");
+            return Ok(());
+        }
+    } else {
+        warn!("⚠️ WebSocket not available, skipping trading cycle");
+        return Ok(());
+    };
 
     // Calculate inventory skew and status once, reuse throughout the function
     let (inventory_skew, status, should_return) = {
@@ -752,7 +837,9 @@ async fn run_trading_cycle_single_market(
         let skew = inventory_skew; // Use the pre-calculated skew
         
         // UP logic: Skip buying UP when skew is high (UP too much)
-        let skip_buy_up = skew > 0.7;
+        // Python: max_skew = order_size * 0.4 (normalized to ~0.4)
+        let max_skew_threshold = 0.4;  // Changed from 0.7 to match Python
+        let skip_buy_up = skew > max_skew_threshold;
         let reason_buy_up = if skip_buy_up {
             format!("UP inventory too high ({:.1}%), skip buying UP", skew * 100.0)
         } else {
@@ -760,7 +847,7 @@ async fn run_trading_cycle_single_market(
         };
         
         // DOWN logic: Skip buying DOWN when skew is low (DOWN too much)
-        let skip_buy_down = skew < -0.7;
+        let skip_buy_down = skew < -max_skew_threshold;
         let reason_buy_down = if skip_buy_down {
             format!("DOWN inventory too high ({:.1}%), skip buying DOWN", skew.abs() * 100.0)
         } else {
@@ -807,119 +894,143 @@ async fn run_trading_cycle_single_market(
     let skew_adjustment = inventory_skew * 0.01; // 1% adjustment per unit of skew
     
     // UP token prices - Python: bid = mid - half_spread + inventory_adjust
-    let up_bid_price = (up_price - spread / 2.0 + skew_adjustment).max(trading_config.safe_range_low).min(trading_config.safe_range_high);
-    let up_ask_price = (up_price + spread / 2.0 + skew_adjustment).max(trading_config.safe_range_low).min(trading_config.safe_range_high);
+    let up_bid_price = ((up_price - spread / 2.0 + skew_adjustment) * 100.0).round() / 100.0;
+    let up_bid_price = up_bid_price.max(trading_config.safe_range_low).min(trading_config.safe_range_high);
+    let up_ask_price = ((up_price + spread / 2.0 + skew_adjustment) * 100.0).round() / 100.0;
+    let up_ask_price = up_ask_price.max(trading_config.safe_range_low).min(trading_config.safe_range_high);
     
     // DOWN token prices - same adjustment as UP
-    let down_bid_price = (down_price - spread / 2.0 + skew_adjustment).max(trading_config.safe_range_low).min(trading_config.safe_range_high);
-    let down_ask_price = (down_price + spread / 2.0 + skew_adjustment).max(trading_config.safe_range_low).min(trading_config.safe_range_high);
+    let down_bid_price = ((down_price - spread / 2.0 + skew_adjustment) * 100.0).round() / 100.0;
+    let down_bid_price = down_bid_price.max(trading_config.safe_range_low).min(trading_config.safe_range_high);
+    let down_ask_price = ((down_price + spread / 2.0 + skew_adjustment) * 100.0).round() / 100.0;
+    let down_ask_price = down_ask_price.max(trading_config.safe_range_low).min(trading_config.safe_range_high);
 
     info!("💰 Order prices - UP: bid={:.4}, ask={:.4} | DOWN: bid={:.4}, ask={:.4}",
         up_bid_price, up_ask_price, down_bid_price, down_ask_price);
 
-    // Dual-sided strategy: Place orders on both UP and DOWN tokens
-    // This creates a market-neutral position where profits come from the spread
+    // Python-style balance check with 15% buffer
+    let up_need = up_price * trading_config.order_size;
+    let down_need = down_price * trading_config.order_size;
     
-    // Place UP buy order (betting UP will go up)
-    let up_buy_task = async {
-        if !skip_buy_up {
-            let size = trading_config.order_size.min(buy_limit_up);
-            place_side_order(
-                &executor,
-                &order_tracker,
-                &trade_history,
-                &stats,
-                &up_token_id,
-                Side::Buy,
-                up_bid_price,
-                size,
-                trading_config.safe_range_low,
-                trading_config.safe_range_high,
-                "UP",
-            ).await
-        } else {
-            Ok(())
-        }
+    // Calculate actual needs based on skew (only buy the side that needs it)
+    let (actual_up_need, actual_down_need) = if inventory_skew > 0.4 {
+        // UP too much, only buy DOWN
+        (0.0, down_need)
+    } else if inventory_skew < -0.4 {
+        // DOWN too much, only buy UP
+        (up_need, 0.0)
+    } else {
+        // Balanced, buy both
+        (up_need, down_need)
     };
+    
+    const BUFFER_RATIO: f64 = 1.15; // 15% buffer like Python
+    let total_need = (actual_up_need + actual_down_need) * BUFFER_RATIO;
+    
+    // Check balance
+    let balance = executor.get_usdc_balance().await.unwrap_or(0.0);
+    if balance < total_need {
+        warn!("⚠️ Insufficient balance (with buffer): {:.2} < {:.2} (need UP:{:.2} + DOWN:{:.2} × {:.2})",
+            balance, total_need, actual_up_need, actual_down_need, BUFFER_RATIO);
+        warn!("⏹️ Skipping orders - need both sides for hedge");
+        return Ok(());
+    }
+    info!("✅ Balance sufficient (with buffer): {:.2} >= {:.2}", balance, total_need);
 
-    // Place UP sell order - SELL is always allowed (matches Python)
-    let up_sell_task = async {
-        // No skip check for sell, always allow
-        let size = trading_config.order_size;
-        place_side_order(
-            &executor,
-            &order_tracker,
-            &trade_history,
-            &stats,
+    // Buy-and-hold strategy: Only place BUY orders on UP and DOWN tokens
+    // Wait for market settlement, no active market making
+    
+    // Calculate actual sizes based on skew
+    let base_size = trading_config.order_size;
+    let remaining = trading_config.max_total_position - status.total_value;
+    
+    let (up_size, down_size) = if inventory_skew > 0.4 {
+        // UP too much, only buy DOWN
+        warn!("⚠️ UP skew too high ({:.1}), buying only DOWN to balance", inventory_skew);
+        (0.0, base_size.min(remaining))
+    } else if inventory_skew < -0.4 {
+        // DOWN too much, only buy UP
+        warn!("⚠️ DOWN skew too high ({:.1}), buying only UP to balance", inventory_skew.abs());
+        (base_size.min(remaining), 0.0)
+    } else {
+        // Balanced, buy both
+        (base_size.min(remaining / 2.0), base_size.min(remaining / 2.0))
+    };
+    
+    if up_size == 0.0 && down_size == 0.0 {
+        warn!("⏹️ No size to trade");
+        return Ok(());
+    }
+    
+    info!("📊 Will place: UP={:.1}, DOWN={:.1}", up_size, down_size);
+
+    // Place UP buy order first (skip balance check as per Python)
+    let mut placed_up = 0.0;
+    let mut placed_down = 0.0;
+    
+    if up_size > 0.0 && !skip_buy_up {
+        info!("🔍 UP: BUY @ {:.4} size={:.1}", up_bid_price, up_size);
+        match executor.place_order_complete(
             &up_token_id,
-            Side::Sell,
-            up_ask_price,
-            size,
+            Side::Buy,
+            up_bid_price,
+            up_size,
             trading_config.safe_range_low,
             trading_config.safe_range_high,
-            "UP",
-        ).await
-    };
+        ).await {
+            Ok(Some(order_id)) => {
+                info!("✅ UP order placed: {}", order_id);
+                placed_up = up_size;
+                stats.write().await.record_order_placed(up_size);
+                order_tracker.write().await.track_order(
+                    up_token_id.clone(), order_id, "BUY".to_string(), up_bid_price, up_size);
+            }
+            Ok(None) => {
+                warn!("❌ UP order failed (returned None)");
+            }
+            Err(e) => {
+                warn!("❌ UP order failed: {}", e);
+            }
+        }
+    }
 
-    // Place DOWN buy order (betting DOWN will go up = UP will go down)
-    let down_buy_task = async {
-        if !skip_buy_down {
-            let size = trading_config.order_size.min(buy_limit_down);
-            place_side_order(
-                &executor,
-                &order_tracker,
-                &trade_history,
-                &stats,
+    // Place DOWN buy order (check balance again as per Python)
+    if down_size > 0.0 && !skip_buy_down {
+        // Re-check balance after UP order
+        let balance_after_up = executor.get_usdc_balance().await.unwrap_or(0.0);
+        let down_need_now = down_bid_price * down_size * BUFFER_RATIO;
+        
+        if balance_after_up < down_need_now {
+            warn!("⚠️ Insufficient balance for DOWN after UP order: {:.2} < {:.2}",
+                balance_after_up, down_need_now);
+        } else {
+            info!("🔍 DOWN: BUY @ {:.4} size={:.1}", down_bid_price, down_size);
+            match executor.place_order_complete(
                 &down_token_id,
                 Side::Buy,
                 down_bid_price,
-                size,
+                down_size,
                 trading_config.safe_range_low,
                 trading_config.safe_range_high,
-                "DOWN",
-            ).await
-        } else {
-            Ok(())
+            ).await {
+                Ok(Some(order_id)) => {
+                    info!("✅ DOWN order placed: {}", order_id);
+                    placed_down = down_size;
+                    stats.write().await.record_order_placed(down_size);
+                    order_tracker.write().await.track_order(
+                        down_token_id.clone(), order_id, "BUY".to_string(), down_bid_price, down_size);
+                }
+                Ok(None) => {
+                    warn!("❌ DOWN order failed (returned None)");
+                }
+                Err(e) => {
+                    warn!("❌ DOWN order failed: {}", e);
+                }
+            }
         }
-    };
-
-    // Place DOWN sell order - SELL is always allowed (matches Python)
-    let down_sell_task = async {
-        // No skip check for sell, always allow
-        let size = trading_config.order_size;
-        place_side_order(
-            &executor,
-            &order_tracker,
-            &trade_history,
-            &stats,
-            &down_token_id,
-            Side::Sell,
-            down_ask_price,
-            size,
-            trading_config.safe_range_low,
-            trading_config.safe_range_high,
-            "DOWN",
-        ).await
-    };
-
-    // Execute all four orders concurrently
-    let (up_buy_result, up_sell_result, down_buy_result, down_sell_result) = 
-        tokio::join!(up_buy_task, up_sell_task, down_buy_task, down_sell_task);
-
-    if let Err(e) = up_buy_result {
-        error!("UP Buy order task failed: {}", e);
-    }
-    if let Err(e) = up_sell_result {
-        error!("UP Sell order task failed: {}", e);
-    }
-    if let Err(e) = down_buy_result {
-        error!("DOWN Buy order task failed: {}", e);
-    }
-    if let Err(e) = down_sell_result {
-        error!("DOWN Sell order task failed: {}", e);
     }
 
-    info!("Trading cycle completed for market {}/{}", up_token_id, down_token_id);
+    info!("✅ Trading cycle completed: UP={:.1}, DOWN={:.1}", placed_up, placed_down);
     info!("⏱️ Trading cycle took: {:?}", cycle_start.elapsed());
     Ok(())
 }

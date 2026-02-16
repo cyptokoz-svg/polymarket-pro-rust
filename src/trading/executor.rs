@@ -12,6 +12,7 @@ use polymarket_client_sdk::{
     types::{Decimal, U256},
 };
 use alloy::signers::local::PrivateKeySigner;
+use alloy::signers::Signer;
 use std::str::FromStr;
 use tracing::{info, error, warn};
 use crate::utils::retry::{retry_with_backoff, RetryConfig};
@@ -84,7 +85,9 @@ impl TradeExecutor {
 
     /// Get signer from private key
     fn get_signer(&self) -> Result<PrivateKeySigner, Box<dyn std::error::Error>> {
-        let signer = PrivateKeySigner::from_str(&self.private_key)?;
+        let mut signer = PrivateKeySigner::from_str(&self.private_key)?;
+        // Set chain ID for Polygon mainnet (required by SDK)
+        signer.set_chain_id(Some(137));
         Ok(signer)
     }
 
@@ -194,7 +197,11 @@ impl TradeExecutor {
             .await?;
         
         let token_id_u256 = U256::from_str(token_id)?;
-        let price_decimal = Decimal::from_f64_retain(price).unwrap_or(Decimal::ZERO);
+        // Round price to 2 decimal places to match tick size 0.01
+        // Use Decimal for precise rounding
+        let price_decimal = Decimal::from_f64_retain(price)
+            .map(|d| d.round_dp(2))  // Round to 2 decimal places
+            .unwrap_or(Decimal::ZERO);
         let size_decimal = Decimal::from_f64_retain(size).unwrap_or(Decimal::ZERO);
         
         // Build, sign and post order

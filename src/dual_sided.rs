@@ -186,20 +186,12 @@ pub async fn run_trading_cycle_dual_sided(
     
     info!("💰 Final prices: UP={}, DOWN={}", up_price, down_price);
     
-    // BUG FIX: Extreme price protection (Python: EXTREME_MIN = 0.05, EXTREME_MAX = 0.95)
-    const EXTREME_MIN: f64 = 0.05;
-    const EXTREME_MAX: f64 = 0.95;
+    // Extreme price protection: 0.1-0.9 (no orders in 0-0.1 or 0.9-1.0)
+    const EXTREME_MIN: f64 = 0.10;
+    const EXTREME_MAX: f64 = 0.90;
     if up_price < EXTREME_MIN || up_price > EXTREME_MAX || down_price < EXTREME_MIN || down_price > EXTREME_MAX {
         warn!("⚠️ Extreme prices detected: UP={}, DOWN={}", up_price, down_price);
         warn!("⏹️ Skipping all orders - prices outside safe range [{}, {}]", EXTREME_MIN, EXTREME_MAX);
-        return Ok(());
-    }
-    
-    // Validate prices (Python: MIN_PRICE = 0.01, MAX_PRICE = 0.99)
-    const MIN_PRICE: f64 = 0.01;
-    const MAX_PRICE: f64 = 0.99;
-    if up_price < MIN_PRICE || up_price > MAX_PRICE || down_price < MIN_PRICE || down_price > MAX_PRICE {
-        warn!("⚠️ Prices outside safe range [{}, {}]", MIN_PRICE, MAX_PRICE);
         return Ok(());
     }
     

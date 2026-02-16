@@ -48,6 +48,23 @@ struct BookEvent {
     asks: Vec<HashMap<String, String>>,
 }
 
+/// Price change 条目格式
+#[derive(Debug, Clone, Deserialize)]
+struct PriceChangeEntry {
+    #[serde(rename = "asset_id")]
+    asset_id: String,
+    price: String,
+    size: String,
+}
+
+/// Price changes 消息格式
+#[derive(Debug, Clone, Deserialize)]
+struct PriceChangesEvent {
+    market: String,
+    #[serde(rename = "price_changes")]
+    price_changes: Vec<PriceChangeEntry>,
+}
+
 /// 价格更新
 #[derive(Debug, Clone)]
 pub struct PriceUpdate {
@@ -73,6 +90,8 @@ pub struct PolymarketWebSocket {
     last_display_time: Arc<RwLock<f64>>,
     /// 统计
     messages_received: Arc<RwLock<u64>>,
+    /// 重启标志 - 用于市场切换时重新连接
+    restart_flag: Arc<RwLock<bool>>,
 }
 
 impl PolymarketWebSocket {
@@ -86,6 +105,7 @@ impl PolymarketWebSocket {
             running: Arc::new(RwLock::new(false)),
             last_display_time: Arc::new(RwLock::new(0.0)),
             messages_received: Arc::new(RwLock::new(0)),
+            restart_flag: Arc::new(RwLock::new(false)),
         }
     }
 
@@ -137,19 +157,118 @@ impl PolymarketWebSocket {
         *running = false;
         info!("WebSocket client stopping...");
     }
+    
+    /// 重启 WebSocket - 用于市场切换时重新订阅
+    pub async fn restart(&self) {
+        info!("🔄 Restarting WebSocket for new subscription...");
+        // Stop current connection
+        {
+            let mut running = self.running.write().await;
+            *running = false;
+        }
+        // Wait for connection to close (like Python's time.sleep(1))
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        
+        // Clear prices
+        {
+            let mut prices = self.last_prices.write().await;
+            prices.clear();
+        }
+        
+        // Get current tokens
+        let token_ids = {
+            self.subscribed_tokens.read().await.clone()
+        };
+        
+        // Start again - restart the connection task
+        {
+            let mut running = self.running.write().await;
+            *running = true;
+        }
+        
+        // Clone Arc for new task
+        let subscribed_tokens = self.subscribed_tokens.clone();
+        let last_prices = self.last_prices.clone();
+        let msg_counter = self.msg_counter.clone();
+        let running = self.running.clone();
+        let last_display_time = self.last_display_time.clone();
+        let messages_received = self.messages_received.clone();
+        let token_labels = self.token_labels.clone();
+        
+        // Spawn new connection task
+        tokio::spawn(async move {
+            Self::connect_market(
+                subscribed_tokens,
+                last_prices,
+                msg_counter,
+                running,
+                last_display_time,
+                messages_received,
+                token_labels,
+            ).await;
+        });
+        
+        info!("✅ WebSocket restarted with {} markets", token_ids.len());
+    }
 
-    /// 更新订阅的 token
+    /// 更新订阅的 token - 完全重启 WebSocket（像 Python 一样）
     pub async fn update_subscription(&self, token_ids: Vec<String>) {
-        info!("📡 Updating subscription to {} tokens", token_ids.len());
-        let mut tokens = self.subscribed_tokens.write().await;
-        *tokens = token_ids;
+        info!("📡 Updating subscription to {} tokens - restarting WebSocket", token_ids.len());
+        
+        // Stop current connection
+        {
+            let mut running = self.running.write().await;
+            *running = false;
+        }
+        
+        // Wait for connection to close (like Python's time.sleep(1))
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        
+        // Update tokens
+        {
+            let mut tokens = self.subscribed_tokens.write().await;
+            *tokens = token_ids;
+        }
+        
+        // Clear old prices (like Python)
+        {
+            let mut prices = self.last_prices.write().await;
+            prices.clear();
+            info!("🧹 Cleared old price cache for new market");
+        }
+        
+        // Restart connection
+        {
+            let mut running = self.running.write().await;
+            *running = true;
+        }
+        
+        info!("✅ WebSocket restart scheduled for new subscription");
     }
 
     /// 获取最新价格
     pub async fn get_price(&self, token_id: &str) -> Option<(f64, f64)> {
+        // Use FIRST 20 chars of token ID as key to match Gamma API behavior
+        // Gamma API returns short IDs (20 chars), WebSocket returns long IDs (77+ chars)
+        let short_token_id = if token_id.len() > 20 {
+            &token_id[..20]
+        } else {
+            token_id
+        };
+        
         let prices = self.last_prices.read().await;
-        let bid = prices.get(&format!("{}_bid", token_id)).copied();
-        let ask = prices.get(&format!("{}_ask", token_id)).copied();
+        let bid_key = format!("{}_bid", short_token_id);
+        let ask_key = format!("{}_ask", short_token_id);
+        let bid = prices.get(&bid_key).copied();
+        let ask = prices.get(&ask_key).copied();
+        
+        // Debug: print available keys if not found
+        if bid.is_none() || ask.is_none() {
+            info!("DEBUG get_price: token_id={}, short={}, bid_key={}, ask_key={}, bid={:?}, ask={:?}", 
+                token_id, short_token_id, bid_key, ask_key, bid, ask);
+            info!("DEBUG available keys: {:?}", prices.keys().collect::<Vec<_>>());
+        }
+        
         match (bid, ask) {
             (Some(b), Some(a)) => Some((b, a)),
             _ => None,
@@ -163,8 +282,10 @@ impl PolymarketWebSocket {
         let mut result = HashMap::new();
         
         for token in tokens.iter() {
-            let bid = prices.get(&format!("{}_bid", token)).copied();
-            let ask = prices.get(&format!("{}_ask", token)).copied();
+            // Use short token ID (first 20 chars) to match storage key
+            let short_token = if token.len() > 20 { &token[..20] } else { token };
+            let bid = prices.get(&format!("{}_bid", short_token)).copied();
+            let ask = prices.get(&format!("{}_ask", short_token)).copied();
             if let (Some(b), Some(a)) = (bid, ask) {
                 result.insert(token.clone(), (b, a));
             }
@@ -317,39 +438,73 @@ impl PolymarketWebSocket {
         last_display_time: &Arc<RwLock<f64>>,
         token_labels: &Arc<RwLock<HashMap<String, String>>>,
     ) {
+        // 打印原始消息前200字符用于调试
+        info!("WebSocket raw message: {}...", &text[..text.len().min(200)]);
+        
         // 尝试解析为对象（book 事件）- 这是主要的数据来源
-        if let Ok(event) = serde_json::from_str::<BookEvent>(text) {
-            debug!("Received book event for asset: {}, bids: {}, asks: {}", 
-                event.asset_id, event.bids.len(), event.asks.len());
-            
-            // 打印第一个 bid 和 ask 来调试
-            if let Some(first_bid) = event.bids.first() {
-                if let Some(price) = first_bid.get("price") {
-                    debug!("First bid price: {}", price);
+        match serde_json::from_str::<BookEvent>(text) {
+            Ok(event) => {
+                info!("Received book event for asset: {}, event_type: {}, bids: {}, asks: {}", 
+                    event.asset_id, event.event_type, event.bids.len(), event.asks.len());
+                
+                if event.event_type == "book" {
+                    Self::process_book_event(
+                        event,
+                        last_prices,
+                        last_display_time,
+                        token_labels,
+                    ).await;
                 }
+                return;
             }
-            if let Some(first_ask) = event.asks.first() {
-                if let Some(price) = first_ask.get("price") {
-                    debug!("First ask price: {}", price);
-                }
+            Err(e) => {
+                info!("Failed to parse as BookEvent: {}", e);
             }
-            
-            if event.event_type == "book" {
-                Self::process_book_event(
-                    event,
+        }
+
+        // 尝试解析为数组（订单簿快照）- 复刻 Python List 格式处理
+        match serde_json::from_str::<Vec<OrderBookEntry>>(text) {
+            Ok(entries) => {
+                info!("Received orderbook snapshot with {} entries", entries.len());
+                // 处理快照 - 使用轮询 token 方式复刻 Python 逻辑
+                Self::process_orderbook_snapshot(
+                    entries,
+                    _subscribed_tokens,
                     last_prices,
+                    _msg_counter,
                     last_display_time,
                     token_labels,
                 ).await;
+                return;
             }
-            return;
+            Err(e) => {
+                info!("Failed to parse as Vec<OrderBookEntry>: {}", e);
+            }
         }
 
-        // 尝试解析为数组（订单簿快照）- 备用
-        if let Ok(entries) = serde_json::from_str::<Vec<OrderBookEntry>>(text) {
-            debug!("Received orderbook snapshot with {} entries", entries.len());
-            // 不再处理快照，因为 book 事件更可靠
-            return;
+        // 尝试解析为 price_changes 事件
+        match serde_json::from_str::<PriceChangesEvent>(text) {
+            Ok(event) => {
+                info!("Received price_changes event with {} entries", event.price_changes.len());
+                for change in event.price_changes {
+                    if let (Ok(price), Ok(_size)) = (change.price.parse::<f64>(), change.size.parse::<f64>()) {
+                        let short_token_id = if change.asset_id.len() > 20 {
+                            &change.asset_id[..20]
+                        } else {
+                            &change.asset_id
+                        };
+                        // 存储为 bid 和 ask（price_changes 通常是最新成交价）
+                        let mut prices = last_prices.write().await;
+                        prices.insert(format!("{}_bid", short_token_id), price);
+                        prices.insert(format!("{}_ask", short_token_id), price);
+                        info!("DEBUG storing price_change: key={}_bid/ask, price={}", short_token_id, price);
+                    }
+                }
+                return;
+            }
+            Err(e) => {
+                info!("Failed to parse as PriceChangesEvent: {}", e);
+            }
         }
 
         // 尝试解析为通用 JSON
@@ -359,7 +514,6 @@ impl PolymarketWebSocket {
     }
 
     /// 处理订单簿快照 - 复刻 Python List 格式处理
-    #[allow(dead_code)]
     async fn process_orderbook_snapshot(
         entries: Vec<OrderBookEntry>,
         subscribed_tokens: &Arc<RwLock<Vec<String>>>,
@@ -455,7 +609,15 @@ impl PolymarketWebSocket {
         last_display_time: &Arc<RwLock<f64>>,
         token_labels: &Arc<RwLock<HashMap<String, String>>>,
     ) {
-        let token_id = event.asset_id;
+        // Use FIRST 20 chars of token ID as key to match Gamma API behavior
+        // Gamma API returns short IDs (20 chars), WebSocket returns long IDs (77+ chars)
+        // The first 20 chars of WebSocket asset_id match the Gamma API token_id
+        let full_token_id = event.asset_id;
+        let short_token_id = if full_token_id.len() > 20 {
+            full_token_id[..20].to_string()
+        } else {
+            full_token_id.clone()
+        };
 
         // 解析 bids - best bid = 最高价格 = 第一个元素 (matches Python: parsed_bids[0])
         let best_bid = event.bids.first()
@@ -466,16 +628,30 @@ impl PolymarketWebSocket {
         let best_ask = event.asks.first()
             .and_then(|a| a.get("price"))
             .and_then(|p| p.parse::<f64>().ok());
+        
+        info!("DEBUG price parsing: bids_count={}, asks_count={}, best_bid={:?}, best_ask={:?}", 
+            event.bids.len(), event.asks.len(), best_bid, best_ask);
+        if let Some(first_bid) = event.bids.first() {
+            info!("DEBUG first bid: {:?}", first_bid);
+        }
+        if let Some(first_ask) = event.asks.first() {
+            info!("DEBUG first ask: {:?}", first_ask);
+        }
 
-        // 更新缓存
+        // 更新缓存 - use short token ID as key
         {
             let mut prices = last_prices.write().await;
             if let Some(bid) = best_bid {
-                prices.insert(format!("{}_bid", token_id), bid);
+                let key = format!("{}_bid", short_token_id);
+                info!("DEBUG storing: key={}, bid={}", key, bid);
+                prices.insert(key, bid);
             }
             if let Some(ask) = best_ask {
-                prices.insert(format!("{}_ask", token_id), ask);
+                let key = format!("{}_ask", short_token_id);
+                info!("DEBUG storing: key={}, ask={}", key, ask);
+                prices.insert(key, ask);
             }
+            info!("DEBUG total keys in cache: {}", prices.len());
         }
 
         // 每 5 秒打印一次
@@ -496,8 +672,8 @@ impl PolymarketWebSocket {
 
         if should_display && (best_bid.is_some() || best_ask.is_some()) {
             let labels = token_labels.read().await;
-            let _label = labels.get(&token_id).cloned().unwrap_or_else(|| {
-                token_id.chars().take(6).collect()
+            let _label = labels.get(&short_token_id).cloned().unwrap_or_else(|| {
+                short_token_id.chars().take(6).collect()
             });
             let _bid_str = best_bid.map(|b| format!("{:.4}", b)).unwrap_or_else(|| "--".to_string());
             let _ask_str = best_ask.map(|a| format!("{:.4}", a)).unwrap_or_else(|| "--".to_string());
