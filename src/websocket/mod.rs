@@ -457,13 +457,13 @@ impl PolymarketWebSocket {
     ) {
         let token_id = event.asset_id;
 
-        // 解析 bids - best bid = 最高价格 = 最后一个元素
-        let best_bid = event.bids.last()
+        // 解析 bids - best bid = 最高价格 = 第一个元素 (matches Python: parsed_bids[0])
+        let best_bid = event.bids.first()
             .and_then(|b| b.get("price"))
             .and_then(|p| p.parse::<f64>().ok());
 
-        // 解析 asks - best ask = 最低价格 = 最后一个元素
-        let best_ask = event.asks.last()
+        // 解析 asks - best ask = 最低价格 = 第一个元素 (matches Python: parsed_asks[0])
+        let best_ask = event.asks.first()
             .and_then(|a| a.get("price"))
             .and_then(|p| p.parse::<f64>().ok());
 
