@@ -1,13 +1,22 @@
 //! Trading execution using polymarket-client-sdk 0.4
-//! Simplified implementation for compilation
+//! Uses dynamic client creation per operation to handle type states
 
-use polymarket_client_sdk::clob::types::Side;
+use polymarket_client_sdk::{
+    clob::{
+        Client,
+        Config,
+        types::{Side, OrderType},
+        types::request::OrdersRequest,
+        types::response::PostOrderResponse,
+    },
+    types::{Decimal, U256},
+};
+use alloy::signers::local::PrivateKeySigner;
+use std::str::FromStr;
 use tracing::{info, error, warn};
 use crate::utils::retry::{retry_with_backoff, RetryConfig};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use alloy_signer_local::PrivateKeySigner;
-use std::str::FromStr;
 
 /// Result of canceling orders for a market
 #[derive(Debug, Clone)]
@@ -73,6 +82,12 @@ impl TradeExecutor {
         })
     }
 
+    /// Get signer from private key
+    fn get_signer(&self) -> Result<PrivateKeySigner, Box<dyn std::error::Error>> {
+        let signer = PrivateKeySigner::from_str(&self.private_key)?;
+        Ok(signer)
+    }
+
     /// Set simulation mode
     pub fn set_simulation_mode(&mut self, enabled: bool) {
         self.simulation_mode = enabled;
@@ -90,12 +105,9 @@ impl TradeExecutor {
 
     /// Get the signer address
     pub fn address(&self) -> String {
-        // Parse private key to get address using alloy
-        if let Ok(signer) = PrivateKeySigner::from_str(&self.private_key) {
-            format!("{:?}", signer.address())
-        } else {
-            // Fallback: try to extract from env
-            std::env::var("BROWSER_ADDRESS").unwrap_or_else(|_| "0x0".to_string())
+        match self.get_signer() {
+            Ok(signer) => format!("{:?}", signer.address()),
+            Err(_) => "0x0".to_string(),
         }
     }
 
@@ -125,16 +137,12 @@ impl TradeExecutor {
         let text = response.text().await?;
         info!("Balance API response: {}", &text[..text.len().min(200)]);
         
-        // Try to parse as JSON
         let balance: f64 = if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-            // Try different formats
             data.get("USDC")
                 .and_then(|v| v.as_f64())
                 .or_else(|| data.get("USDC").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()))
-                .or_else(|| data.get("balance").and_then(|v| v.as_f64()))
                 .unwrap_or(0.0)
         } else {
-            // Try parsing as plain number
             text.trim().parse().unwrap_or(0.0)
         };
         
@@ -142,102 +150,54 @@ impl TradeExecutor {
         Ok(balance)
     }
 
-    /// Check if order ID is valid
-    pub fn is_valid_order_id(&self, order_id: &str) -> bool {
-        if order_id.is_empty() {
-            return false;
-        }
-        if order_id.len() < 10 {
-            return false;
-        }
-        true
-    }
-
-    /// Check order status
-    pub fn is_order_successful(&self, status: &str, has_error: bool) -> bool {
-        if has_error {
-            return false;
-        }
-        matches!(status.to_uppercase().as_str(),
-            "LIVE" | "OPEN" | "PENDING" | "MATCHED" | "FILLED")
-    }
-
-    /// Place order with full validation
-    pub async fn place_order_complete(
+    /// Place a limit order
+    pub async fn place_limit_order(
         &self,
         token_id: &str,
         side: Side,
         price: f64,
         size: f64,
-        safe_low: f64,
-        safe_high: f64,
-    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-        // 1. Simulation mode check
+    ) -> Result<PostOrderResponse, Box<dyn std::error::Error>> {
         if self.simulation_mode {
             info!("🎮 [SIMULATION] {:?} {} @ {}", side, size, price);
-            return Ok(Some(format!("simulated_{}", uuid::Uuid::new_v4())));
+            // Create mock response via JSON
+            let mock_json = serde_json::json!({
+                "order_id": format!("simulated_{}", uuid::Uuid::new_v4()),
+                "success": true,
+                "status": "LIVE"
+            });
+            let response: PostOrderResponse = serde_json::from_value(mock_json)?;
+            return Ok(response);
         }
-        info!("🔴 [LIVE] Preparing {:?} {} @ {}", side, price, size);
-
-        // 2. Price check
-        if !self.is_price_in_safe_range(price, safe_low, safe_high) {
-            warn!("Price {} outside safe range [{}, {}]", price, safe_low, safe_high);
-            return Ok(None);
-        }
-        info!("✅ Price check passed");
-
-        // 3. Balance check
-        let balance = self.get_usdc_balance().await?;
-        let need = size * price;
-        info!("💰 Balance: {:.2} USDC, Need: {:.2}", balance, need);
-
-        if balance < need {
-            warn!("⚠️ Insufficient balance: {:.2} < {:.2}", balance, need);
-            return Ok(None);
-        }
-        info!("✅ Balance check passed");
-
-        // 4. API rate limit protection
-        info!("⏳ Waiting for rate limiter...");
-        self.rate_limiter.wait().await;
-        info!("✅ Rate limiter passed");
-
-        // 5. Place order
-        info!("📤 Placing order: {:?} {} @ {}", side, size, price);
         
-        let result = self.place_limit_order(token_id, side, price, size).await;
+        let signer = self.get_signer()?;
+        let config = Config::builder().use_server_time(true).build();
         
-        match result {
-            Ok(response) => {
-                let order_id = response.get("order_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                info!("✅ ORDER PLACED: {}", order_id);
-                Ok(Some(order_id))
-            }
-            Err(e) => {
-                error!("❌ Order failed: {}", e);
-                Ok(None)
-            }
-        }
-    }
-
-    /// Place a limit order
-    pub async fn place_limit_order(
-        &self,
-        _token_id: &str,
-        _side: Side,
-        _price: f64,
-        _size: f64,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-        // Simplified: return simulated response
-        let response = serde_json::json!({
-            "order_id": format!("order_{}", uuid::Uuid::new_v4()),
-            "success": true,
-            "status": "LIVE"
-        });
+        // Create and authenticate client inline
+        let client = Client::new("https://clob.polymarket.com", config)?
+            .authentication_builder(&signer)
+            .authenticate()
+            .await?;
         
+        let token_id_u256 = U256::from_str(token_id)?;
+        let price_decimal = Decimal::from_f64_retain(price).unwrap_or(Decimal::ZERO);
+        let size_decimal = Decimal::from_f64_retain(size).unwrap_or(Decimal::ZERO);
+        
+        // Build, sign and post order
+        let order = client
+            .limit_order()
+            .token_id(token_id_u256)
+            .size(size_decimal)
+            .price(price_decimal)
+            .side(side)
+            .order_type(OrderType::GTC)
+            .build()
+            .await?;
+        
+        let signed_order = client.sign(&signer, order).await?;
+        let response = client.post_order(signed_order).await?;
+        
+        info!("✅ Order placed: {} (success: {})", response.order_id, response.success);
         Ok(response)
     }
 
@@ -247,7 +207,7 @@ impl TradeExecutor {
         token_id: &str,
         price: f64,
         size: f64,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    ) -> Result<PostOrderResponse, Box<dyn std::error::Error>> {
         self.place_limit_order(token_id, Side::Buy, price, size).await
     }
 
@@ -257,7 +217,7 @@ impl TradeExecutor {
         token_id: &str,
         price: f64,
         size: f64,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    ) -> Result<PostOrderResponse, Box<dyn std::error::Error>> {
         self.place_limit_order(token_id, Side::Sell, price, size).await
     }
 
@@ -265,18 +225,74 @@ impl TradeExecutor {
     pub async fn get_open_orders(
         &self,
     ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
-        Ok(vec![])
+        if self.simulation_mode {
+            return Ok(vec![]);
+        }
+        
+        let signer = self.get_signer()?;
+        let config = Config::builder().use_server_time(true).build();
+        
+        let client = Client::new("https://clob.polymarket.com", config)?
+            .authentication_builder(&signer)
+            .authenticate()
+            .await?;
+        
+        let request = OrdersRequest::default();
+        let response = client.orders(&request, None).await?;
+        
+        // Convert to JSON values for flexibility
+        let orders: Vec<serde_json::Value> = response.data
+            .into_iter()
+            .map(|order| serde_json::json!({
+                "id": order.id,
+                "asset_id": order.asset_id,
+                "side": order.side,
+                "price": order.price,
+                "size": order.original_size,
+                "status": order.status,
+            }))
+            .collect();
+        
+        Ok(orders)
     }
 
     /// Cancel a specific order by ID
     pub async fn cancel_order(&self, order_id: &str) -> Result<(), Box<dyn std::error::Error>> {
-        info!("Would cancel order: {}", order_id);
+        if self.simulation_mode {
+            info!("🎮 [SIMULATION] Would cancel order: {}", order_id);
+            return Ok(());
+        }
+        
+        let signer = self.get_signer()?;
+        let config = Config::builder().use_server_time(true).build();
+        
+        let client = Client::new("https://clob.polymarket.com", config)?
+            .authentication_builder(&signer)
+            .authenticate()
+            .await?;
+        
+        client.cancel_order(order_id).await?;
+        info!("✅ Cancelled order: {}", order_id);
         Ok(())
     }
 
     /// Cancel all orders
     pub async fn cancel_all(&self) -> Result<(), Box<dyn std::error::Error>> {
-        info!("Cancel all orders - simplified implementation");
+        if self.simulation_mode {
+            info!("🎮 [SIMULATION] Would cancel all orders");
+            return Ok(());
+        }
+        
+        let signer = self.get_signer()?;
+        let config = Config::builder().use_server_time(true).build();
+        
+        let client = Client::new("https://clob.polymarket.com", config)?
+            .authentication_builder(&signer)
+            .authenticate()
+            .await?;
+        
+        client.cancel_all_orders().await?;
+        info!("✅ Cancelled all orders");
         Ok(())
     }
 
@@ -287,9 +303,29 @@ impl TradeExecutor {
     ) -> Result<CancelOrdersResult, Box<dyn std::error::Error>> {
         info!("Cancelling orders for market {}", token_id);
         
+        let orders = self.get_open_orders().await?;
+        let mut cancelled = 0;
+        let mut filled_orders = vec![];
+        
+        for order in &orders {
+            let order_id = order.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let asset_id = order.get("asset_id").and_then(|v| v.as_str()).unwrap_or("");
+            
+            if asset_id == token_id {
+                match self.cancel_order(order_id).await {
+                    Ok(_) => cancelled += 1,
+                    Err(e) => {
+                        warn!("Failed to cancel order {}: {}", order_id, e);
+                        filled_orders.push(order_id.to_string());
+                    }
+                }
+            }
+        }
+        
+        info!("✅ Cancelled {}/{} orders for market {}", cancelled, orders.len(), token_id);
         Ok(CancelOrdersResult {
-            cancelled: 0,
-            filled_orders: vec![],
+            cancelled,
+            filled_orders,
         })
     }
 
@@ -297,9 +333,21 @@ impl TradeExecutor {
     pub async fn get_filled_orders(
         &self,
         _token_id: &str,
-        _tracked_order_ids: &[String],
+        tracked_order_ids: &[String],
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        Ok(vec![])
+        let open_orders = self.get_open_orders().await?;
+        let open_ids: std::collections::HashSet<String> = open_orders
+            .iter()
+            .filter_map(|o| o.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .collect();
+        
+        let filled: Vec<String> = tracked_order_ids
+            .iter()
+            .filter(|id| !open_ids.contains(*id))
+            .cloned()
+            .collect();
+        
+        Ok(filled)
     }
 
     /// Get server time
@@ -316,8 +364,8 @@ impl TradeExecutor {
         Ok(markets)
     }
 
-    /// Place order with validation (legacy)
-    pub async fn place_order_with_validation(
+    /// Place order with full validation
+    pub async fn place_order_complete(
         &self,
         token_id: &str,
         side: Side,
@@ -326,6 +374,35 @@ impl TradeExecutor {
         safe_low: f64,
         safe_high: f64,
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-        self.place_order_complete(token_id, side, price, size, safe_low, safe_high).await
+        if !self.is_price_in_safe_range(price, safe_low, safe_high) {
+            warn!("Price {} outside safe range [{}, {}]", price, safe_low, safe_high);
+            return Ok(None);
+        }
+
+        if !self.simulation_mode {
+            let balance = self.get_usdc_balance().await?;
+            let need = size * price;
+            if balance < need {
+                warn!("⚠️ Insufficient balance: {:.2} < {:.2}", balance, need);
+                return Ok(None);
+            }
+        }
+
+        self.rate_limiter.wait().await;
+
+        match self.place_limit_order(token_id, side, price, size).await {
+            Ok(response) => {
+                if response.success {
+                    Ok(Some(response.order_id))
+                } else {
+                    error!("Order failed: {:?}", response.error_msg);
+                    Ok(None)
+                }
+            }
+            Err(e) => {
+                error!("❌ Order placement failed: {}", e);
+                Ok(None)
+            }
+        }
     }
 }
