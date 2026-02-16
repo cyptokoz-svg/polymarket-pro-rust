@@ -138,7 +138,18 @@ async fn main() -> Result<()> {
             
             // Subscribe to WebSocket for initial market and get token IDs
             if !condition_id.is_empty() {
-                if let Some((up_token, down_token)) = subscribe_to_market_ws(&condition_id, ws_subscriber.clone()).await {
+                // Retry getting token IDs up to 3 times
+                let mut token_ids = None;
+                for attempt in 1..=3 {
+                    token_ids = subscribe_to_market_ws(&condition_id, ws_subscriber.clone()).await;
+                    if token_ids.is_some() {
+                        break;
+                    }
+                    warn!("⚠️ Could not get token IDs (attempt {}), retrying...", attempt);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                }
+                
+                if let Some((up_token, down_token)) = token_ids {
                     current_market = Some(MarketInfo {
                         condition_id,
                         up_token,
@@ -146,13 +157,9 @@ async fn main() -> Result<()> {
                         end_date: market.get("endDate").and_then(|v| v.as_str()).map(|s| s.to_string()),
                     });
                 } else {
-                    warn!("⚠️ Could not get token IDs, using condition_id as fallback");
-                    current_market = Some(MarketInfo {
-                        condition_id: condition_id.clone(),
-                        up_token: condition_id.clone(),
-                        down_token: condition_id.clone(),
-                        end_date: market.get("endDate").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    });
+                    error!("🛑 Failed to get token IDs after 3 attempts, skipping this market");
+                    // Don't use condition_id as fallback - it's not a valid token ID
+                    // The market will be skipped and we'll retry in the next cycle
                 }
             }
         }
@@ -200,7 +207,18 @@ async fn main() -> Result<()> {
                                 
                                 // Update WebSocket subscription for new market and get token IDs
                                 if !new_condition_id.is_empty() {
-                                    if let Some((up_token, down_token)) = subscribe_to_market_ws(&new_condition_id, ws_subscriber.clone()).await {
+                                    // Retry getting token IDs up to 3 times
+                                    let mut token_ids = None;
+                                    for attempt in 1..=3 {
+                                        token_ids = subscribe_to_market_ws(&new_condition_id, ws_subscriber.clone()).await;
+                                        if token_ids.is_some() {
+                                            break;
+                                        }
+                                        warn!("⚠️ Could not get token IDs for new market (attempt {}), retrying...", attempt);
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                    }
+                                    
+                                    if let Some((up_token, down_token)) = token_ids {
                                         current_market = Some(MarketInfo {
                                             condition_id: new_condition_id,
                                             up_token,
@@ -208,13 +226,8 @@ async fn main() -> Result<()> {
                                             end_date: new_market.get("endDate").and_then(|v| v.as_str()).map(|s| s.to_string()),
                                         });
                                     } else {
-                                        warn!("⚠️ Could not get token IDs for new market");
-                                        current_market = Some(MarketInfo {
-                                            condition_id: new_condition_id.clone(),
-                                            up_token: new_condition_id.clone(),
-                                            down_token: new_condition_id.clone(),
-                                            end_date: new_market.get("endDate").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                        });
+                                        error!("🛑 Failed to get token IDs for new market after 3 attempts, keeping old market");
+                                        // Don't update current_market - keep trading on old market
                                     }
                                 }
                             }
