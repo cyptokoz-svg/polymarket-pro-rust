@@ -6,6 +6,7 @@ use anyhow::Result;
 use polymarket_pro::*;
 use polymarket_pro::api::Side;
 use polymarket_pro::trading::PriceWarningTracker;
+use polymarket_client_sdk::clob::types::Side as ClobSide;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -15,7 +16,9 @@ use tracing::{error, info, warn, Level};
 // Import BTC market finder
 mod btc_market;
 mod market_manager;
+mod dual_sided;
 use btc_market::find_btc_5min_market;
+use dual_sided::run_trading_cycle_dual_sided;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -251,19 +254,21 @@ async fn main() -> Result<()> {
                 // Apply rate limiting
                 rate_limiter.wait().await;
 
-                // Run trading cycle on current 5-minute market
+                // Run trading cycle on current 5-minute market (dual-sided like Python)
                 let ws_ref = ws_subscriber_trading.clone();
-                if let Err(e) = run_trading_cycle_single_market(
+                let dual_sided_market_info = dual_sided::DualSidedMarketInfo {
+                    up_token: market_info.up_token.clone(),
+                    down_token: market_info.down_token.clone(),
+                };
+                if let Err(e) = run_trading_cycle_dual_sided(
                     executor.clone(),
                     ws_ref,
                     position_tracker.clone(),
                     order_tracker.clone(),
                     trade_history.clone(),
                     stats.clone(),
-                    price_freshness.clone(),
-                    price_warning_tracker.clone(),
                     &config.trading,
-                    &market_info,
+                    &dual_sided_market_info,
                 ).await {
                     error!("Trading cycle error: {}", e);
                     stats.write().await.record_error();
@@ -373,7 +378,7 @@ async fn run_trading_cycle(
     price_freshness: Arc<RwLock<PriceFreshness>>,
     price_warning_tracker: Arc<RwLock<PriceWarningTracker>>,
     trading_config: &TradingConfig,
-    markets: &[rs_clob_client::Market], // Added: cached markets
+    markets: &[polymarket_client_sdk::gamma::types::Market], // Added: cached markets
 ) -> Result<()> {
     info!("Running trading cycle...");
 
@@ -876,7 +881,7 @@ async fn run_trading_cycle_single_market(
 /// Market info with token IDs
 #[derive(Debug, Clone)]
 struct MarketInfo {
-    market: rs_clob_client::Market,
+    market: polymarket_client_sdk::gamma::types::Market,
     up_token: String,
     #[allow(dead_code)]
     down_token: String,
@@ -922,7 +927,7 @@ async fn subscribe_to_market_ws(
     }
 }
 async fn get_market_price(
-    _market: &rs_clob_client::Market,
+    _market: &polymarket_client_sdk::gamma::types::Market,
     ws: Option<&PolymarketWebSocket>,
 ) -> Option<f64> {
     // Try WebSocket first - with retry for initial data

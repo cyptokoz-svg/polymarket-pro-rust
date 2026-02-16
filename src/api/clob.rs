@@ -6,8 +6,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use crate::api::ApiError;
 
-// Re-export Side from rs_clob_client for consistency
-pub use rs_clob_client::Side;
+// Re-export Side from polymarket_client_sdk for consistency
+pub use polymarket_client_sdk::clob::types::Side;
 
 const CLOB_API_URL: &str = "https://clob.polymarket.com";
 

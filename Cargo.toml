@@ -19,7 +19,9 @@ tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
 futures = "0.3"
 
 # Polymarket CLOB client - 核心依赖
-rs-clob-client = "0.1"
+# 注意：使用 0.4.x 最新版本
+polymarket-client-sdk = { version = "0.4", features = ["clob", "ws", "gamma"] }
+rs-builder-signing-sdk = "0.1"
 
 # Alloy ecosystem (与 rs-clob-client 兼容)
 alloy-signer = "0.5"
@@ -30,6 +32,10 @@ alloy-sol-types = "0.8"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# Decimal for price calculations (required by polymarket-client-sdk)
+rust_decimal = "1.35"
+rust_decimal_macros = "1.35"
 
 # Error handling
 anyhow = "1.0"

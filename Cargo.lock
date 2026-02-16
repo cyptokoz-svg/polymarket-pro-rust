@@ -2431,6 +2431,7 @@ dependencies = [
  "pretty_assertions",
  "rand 0.8.5",
  "reqwest",
+ "rs-builder-signing-sdk",
  "rs-clob-client",
  "serde",
  "serde_json",

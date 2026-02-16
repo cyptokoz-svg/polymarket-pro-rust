@@ -9,8 +9,8 @@ pub use gamma::GammaApiClient;
 pub use clob::{ClobClient, ClobApiClient, Order, OrderResponse, OrderStatus};
 pub use market::{MarketInfo, MarketToken, convert_market};
 
-// Re-export Side from rs_clob_client for consistency
-pub use rs_clob_client::Side;
+// Re-export Side from polymarket_client_sdk for consistency
+pub use polymarket_client_sdk::clob::types::Side;
 
 #[cfg(test)]
 pub use clob::MockClobClient;

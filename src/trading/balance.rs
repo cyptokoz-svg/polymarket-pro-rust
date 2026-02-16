@@ -24,7 +24,7 @@ pub struct PositionInfo {
 /// Get USDC balance from CLOB API
 /// Note: This is a placeholder - actual implementation depends on API availability
 pub async fn get_usdc_balance(
-    _clob: &rs_clob_client::ClobClient,
+    _clob: &polymarket_client_sdk::clob::Client,
 ) -> Result<f64, Box<dyn std::error::Error>> {
     // Placeholder - return 0 until API is available
     warn!("get_usdc_balance not fully implemented, returning 0");
@@ -34,7 +34,7 @@ pub async fn get_usdc_balance(
 /// Get all positions from CLOB API
 /// Note: This is a placeholder - actual implementation depends on API availability
 pub async fn get_positions(
-    _clob: &rs_clob_client::ClobClient,
+    _clob: &polymarket_client_sdk::clob::Client,
 ) -> Result<Vec<PositionInfo>, Box<dyn std::error::Error>> {
     // Placeholder - return empty until API is available
     warn!("get_positions not fully implemented, returning empty");
@@ -43,7 +43,7 @@ pub async fn get_positions(
 
 /// Get total position size
 pub async fn get_total_position_size(
-    clob: &rs_clob_client::ClobClient,
+    clob: &polymarket_client_sdk::clob::Client,
 ) -> Result<f64, Box<dyn std::error::Error>> {
     let positions = get_positions(clob).await?;
     let total = positions.iter().map(|p| p.size).sum();

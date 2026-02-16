@@ -49,7 +49,7 @@ impl SimpleMarketManager {
     /// 获取当前活跃市场 - 复刻 Python get_current_market()
     #[allow(dead_code)]
     pub fn get_current_market(&self,
-        all_markets: &[rs_clob_client::Market]
+        all_markets: &[polymarket_client_sdk::gamma::types::Market]
     ) -> Option<MarketInfo> {
         let now = chrono::Utc::now().timestamp();
         let current_slot = (now / 300) * 300;  // 5分钟时间槽
@@ -87,10 +87,10 @@ impl SimpleMarketManager {
         self.find_nearest_market(all_markets, now)
     }
 
-    /// 转换 rs_clob_client::Market 到 MarketInfo
+    /// 转换 polymarket_client_sdk::gamma::types::Market 到 MarketInfo
     #[allow(dead_code)]
     fn convert_to_market_info(&self,
-        market: &rs_clob_client::Market
+        market: &polymarket_client_sdk::gamma::types::Market
     ) -> MarketInfo {
         // 从市场数据中提取 token IDs
         // 注意：实际实现需要根据 Polymarket API 响应格式调整
@@ -113,10 +113,10 @@ impl SimpleMarketManager {
     #[allow(dead_code)]
     fn find_nearest_market(
         &self,
-        all_markets: &[rs_clob_client::Market],
+        all_markets: &[polymarket_client_sdk::gamma::types::Market],
         now: i64
     ) -> Option<MarketInfo> {
-        let mut best_market: Option<(&rs_clob_client::Market, i64)> = None;
+        let mut best_market: Option<(&polymarket_client_sdk::gamma::types::Market, i64)> = None;
 
         for market in all_markets {
             let slug = market.slug.as_deref().unwrap_or("").to_lowercase();

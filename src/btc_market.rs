@@ -3,6 +3,7 @@
 
 use polymarket_pro::trading::TradeExecutor;
 use tracing::{error, info, warn};
+use polymarket_client_sdk::gamma::types::Market;
 
 #[cfg(test)]
 mod tests {
@@ -66,7 +67,7 @@ fn parse_market_end_time(end_date: &str) -> Option<chrono::DateTime<chrono::Utc>
 /// Each market lasts 5 minutes (300 seconds)
 pub async fn find_btc_5min_market(
     executor: &TradeExecutor,
-) -> Option<rs_clob_client::Market> {
+) -> Option<Market> {
     // Try direct Gamma API first for BTC markets
     let now = chrono::Utc::now();
     let now_timestamp = now.timestamp();
@@ -91,7 +92,7 @@ pub async fn find_btc_5min_market(
                     
                     if active && !closed {
                         info!("✅ Found active BTC market: {}", slug);
-                        // Convert to rs_clob_client::Market
+                        // Convert to Market type
                         if let Some(market) = convert_to_market(market_data) {
                             return Some(market);
                         }
@@ -106,7 +107,7 @@ pub async fn find_btc_5min_market(
         Ok(markets) => {
             info!("🔍 Scanning {} markets from executor...", markets.len());
             
-            let mut btc_markets: Vec<(rs_clob_client::Market, i64, Option<i64>)> = Vec::new();
+            let mut btc_markets: Vec<(Market, i64, Option<i64>)> = Vec::new();
             
             for m in markets {
                 let slug = m.slug.as_deref().unwrap_or("").to_lowercase();
@@ -163,8 +164,8 @@ pub async fn find_btc_5min_market(
     None
 }
 
-/// Convert Gamma API market data to rs_clob_client::Market
-fn convert_to_market(data: &serde_json::Value) -> Option<rs_clob_client::Market> {
+/// Convert Gamma API market data to Market type
+fn convert_to_market(data: &serde_json::Value) -> Option<Market> {
     serde_json::from_value(data.clone()).ok()
 }
 

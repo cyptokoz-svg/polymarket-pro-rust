@@ -1,14 +1,16 @@
-//! Trading execution using rs-clob-client
+//! Trading execution using polymarket-client-sdk
 //! Handles order creation, signing, and submission
 
-use rs_clob_client::{
-    ClobClient, Chain, ApiKeyCreds, UserLimitOrder, Side, OrderType,
-};
+use polymarket_client_sdk::clob::{Client as ClobClient, Config};
+use polymarket_client_sdk::clob::types::{Side, OrderType, SignatureType};
+use polymarket_client_sdk::types::Decimal;
 use alloy_signer_local::PrivateKeySigner;
+use alloy_signer::Signer as _;
 use tracing::{info, error, warn};
 use crate::utils::retry::{retry_with_backoff, RetryConfig};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use std::str::FromStr;
 
 /// Result of canceling orders for a market
 #[derive(Debug, Clone)]
@@ -47,7 +49,7 @@ impl RateLimiter {
 
 /// Trading executor
 pub struct TradeExecutor {
-    clob: ClobClient,
+    client: ClobClient,
     signer: PrivateKeySigner,
     simulation_mode: bool,
     rate_limiter: RateLimiter,
@@ -57,60 +59,40 @@ impl TradeExecutor {
     /// Create new trade executor
     pub async fn new(
         private_key: &str,
-        api_key: Option<String>,
-        api_secret: Option<String>,
-        api_passphrase: Option<String>,
+        _api_key: Option<String>,
+        _api_secret: Option<String>,
+        _api_passphrase: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Parse private key
-        let signer: PrivateKeySigner = private_key.parse()?;
+        let signer: PrivateKeySigner = PrivateKeySigner::from_str(private_key)?;
+        
+        info!("Creating CLOB client...");
+        
+        // Create authenticated client using new SDK API
+        let client = retry_with_backoff(
+            "create_clob_client",
+            RetryConfig::new(3, 500),
+            || async {
+                ClobClient::new("https://clob.polymarket.com", Config::default())
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+            },
+        ).await?;
+        
+        // Authenticate the client
+        let client = retry_with_backoff(
+            "authenticate_clob_client",
+            RetryConfig::new(3, 500),
+            || async {
+                client.clone()
+                    .authentication_builder(&signer)
+                    .signature_type(SignatureType::Eoa) // EOA wallet
+                    .authenticate()
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+            },
+        ).await?;
 
-        // Always derive API credentials from private key (more reliable than provided credentials)
-        let creds = {
-            info!("Deriving API credentials from private key...");
-            // Create temporary client to derive API key
-            let temp_client = ClobClient::new(
-                "https://clob.polymarket.com".to_string(),
-                "https://gamma-api.polymarket.com".to_string(),
-                Chain::Polygon,
-                Some(signer.clone()),
-                None, // No creds yet
-                None, // signature_type (0 = EOA)
-                None, // funder_address
-                None, // geo_block_token
-                false, // use_server_time
-                None, // builder_config
-                None, // host_proxy_url
-            )?;
-            
-            match temp_client.create_or_derive_api_key(None).await {
-                Ok(derived_creds) => {
-                    info!("✅ API credentials derived successfully");
-                    Some(derived_creds)
-                }
-                Err(e) => {
-                    warn!("⚠️ Failed to derive API credentials: {}", e);
-                    warn!("⚠️ Some operations may fail without API credentials");
-                    None
-                }
-            }
-        };
-
-        // Create CLOB client with credentials
-        let clob = ClobClient::new(
-            "https://clob.polymarket.com".to_string(),
-            "https://gamma-api.polymarket.com".to_string(),
-            Chain::Polygon,
-            Some(signer.clone()),
-            creds,
-            None, // signature_type (0 = EOA)
-            None, // funder_address
-            None, // geo_block_token
-            false, // use_server_time
-            None, // builder_config
-            None, // host_proxy_url
-        )?;
-
-        info!("TradeExecutor created successfully");
+        info!("✅ TradeExecutor created successfully");
 
         let simulation_mode = std::env::var("SIMULATION_MODE").unwrap_or_default() == "true";
         if simulation_mode {
@@ -118,7 +100,7 @@ impl TradeExecutor {
         }
         
         Ok(Self { 
-            clob, 
+            client, 
             signer,
             simulation_mode,
             rate_limiter: RateLimiter::new(200), // 200ms min interval
@@ -151,9 +133,8 @@ impl TradeExecutor {
     }
 
     /// Get USDC balance from Gamma API
-    /// Fetches actual balance for risk control
     pub async fn get_usdc_balance(&self) -> Result<f64, Box<dyn std::error::Error>> {
-        let address = format!("{:?}", self.signer.address());
+        let address = self.signer.address();
         let url = format!(
             "https://gamma-api.polymarket.com/users/{}/balances",
             address
@@ -170,7 +151,6 @@ impl TradeExecutor {
         let data: serde_json::Value = response.json().await?;
         
         // Parse USDC balance from response
-        // Response format: {"USDC": "1234.56", ...}
         let balance = data
             .get("USDC")
             .and_then(|v| v.as_str())
@@ -204,8 +184,7 @@ impl TradeExecutor {
             "LIVE" | "OPEN" | "PENDING" | "MATCHED" | "FILLED")
     }
 
-    /// Place order with full validation (matches Python _prepare_and_place_order)
-    /// Complete flow: check API -> cancel existing -> place new
+    /// Place order with full validation
     pub async fn place_order_complete(
         &self,
         token_id: &str,
@@ -220,7 +199,7 @@ impl TradeExecutor {
             info!("🎮 [SIMULATION] {:?} {} @ {}", side, size, price);
             return Ok(Some("simulated".to_string()));
         }
-        info!("🔴 [LIVE] Preparing {:?} {} @ {}", side, size, price);
+        info!("🔴 [LIVE] Preparing {:?} {} @ {}", side, price, size);
 
         // 2. Price check
         if !self.is_price_in_safe_range(price, safe_low, safe_high) {
@@ -240,7 +219,7 @@ impl TradeExecutor {
         }
         info!("✅ Balance check passed");
 
-        // 4. Check API for existing orders (skip if simulation mode or no API creds)
+        // 4. Check API for existing orders
         if !self.simulation_mode {
             info!("🔍 Checking existing orders...");
             match self.get_open_orders(token_id).await {
@@ -252,13 +231,11 @@ impl TradeExecutor {
                         info!("🗑️ Cancelling {} orders...", open_orders.len());
                         if let Err(e) = self.cancel_orders_for_market(token_id).await {
                             warn!("⚠️ Failed to cancel orders: {}", e);
-                            // Continue anyway in simulation mode
                         }
                     }
                 }
                 Err(e) => {
                     warn!("⚠️ Failed to check open orders: {}", e);
-                    // Continue anyway - WebSocket price is more important
                 }
             }
         } else {
@@ -266,15 +243,27 @@ impl TradeExecutor {
         }
 
         // 6. API rate limit protection
+        info!("⏳ Waiting for rate limiter...");
         self.rate_limiter.wait().await;
+        info!("✅ Rate limiter passed");
 
-        // 7. Place new order
+        // 7. Place new order using new SDK API
         info!("📤 Placing order: {:?} {} @ {}", side, size, price);
-        let result = self.place_limit_order(token_id, side, price, size).await?;
+        let result = match self.place_limit_order(token_id, side, price, size).await {
+            Ok(r) => {
+                info!("✅ place_limit_order returned successfully");
+                r
+            }
+            Err(e) => {
+                error!("❌ place_limit_order failed: {}", e);
+                return Err(e);
+            }
+        };
 
         // 8. Extract order ID and status
-        let order_id = result.get("orderId")
+        let order_id = result.get("orderID")
             .or(result.get("order_id"))
+            .or(result.get("id"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
@@ -302,30 +291,40 @@ impl TradeExecutor {
     }
 
     /// Get open orders for a token from API
-    /// Matches Python: _get_open_orders_from_api()
     pub async fn get_open_orders(
         &self,
         token_id: &str,
-    ) -> Result<Vec<rs_clob_client::OpenOrder>, Box<dyn std::error::Error>> {
-        use rs_clob_client::OpenOrderParams;
-        
-        // Create params with asset_id filter
-        let params = OpenOrderParams {
-            id: None,
-            market: None,
-            asset_id: Some(token_id.to_string()),
-        };
-        
-        // Use CLOB client's get_open_orders method
-        let open_orders: Vec<rs_clob_client::OpenOrder> = retry_with_backoff(
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        // Use the new SDK's orders endpoint
+        match retry_with_backoff(
             "get_open_orders",
             RetryConfig::new(3, 200),
             || async {
-                self.clob.get_open_orders(Some(params.clone())).await
+                // Get all orders and filter by asset_id
+                let orders = self.client.get_orders().await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                
+                // Filter orders for this token
+                let filtered: Vec<serde_json::Value> = orders
+                    .into_iter()
+                    .filter(|o| {
+                        o.get("asset_id")
+                            .or(o.get("token_id"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s == token_id)
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                
+                Ok::<_, Box<dyn std::error::Error>>(filtered)
             },
-        ).await?;
-
-        Ok(open_orders)
+        ).await {
+            Ok(orders) => Ok(orders),
+            Err(e) => {
+                warn!("⚠️ Failed to get open orders: {}, returning empty list", e);
+                Ok(vec![])
+            }
+        }
     }
 
     /// Cancel a specific order by ID
@@ -337,14 +336,15 @@ impl TradeExecutor {
             "cancel_order",
             RetryConfig::new(3, 200),
             || async {
-                self.clob.cancel_order(order_id).await
+                self.client.cancel_order(order_id).await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
             },
         ).await?;
 
         Ok(())
     }
 
-    /// Place order with full validation (legacy version without complete flow)
+    /// Place order with full validation (legacy version)
     pub async fn place_order_with_validation(
         &self,
         token_id: &str,
@@ -354,12 +354,10 @@ impl TradeExecutor {
         safe_low: f64,
         safe_high: f64,
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-        // Use the complete flow
         self.place_order_complete(token_id, side, price, size, safe_low, safe_high).await
     }
 
-    /// Place a limit order with specific order type (GTC/FOK/FAK)
-    /// Matches Python: create_order with order_type parameter
+    /// Place a limit order with specific order type
     pub async fn place_limit_order_with_type(
         &self,
         token_id: &str,
@@ -368,38 +366,54 @@ impl TradeExecutor {
         size: f64,
         order_type: OrderType,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-        let order = UserLimitOrder {
-            token_id: token_id.to_string(),
-            side,
-            size,
-            price,
-            fee_rate_bps: None,
-            nonce: None,
-            expiration: None,
-            taker: None,
-        };
-
         info!(
             "Placing limit order: {} {:?} @ {} (size: {:?})",
             token_id, side, price, order_type
         );
 
-        // Retry with exponential backoff
-        let result = retry_with_backoff(
-            "place_limit_order",
+        // Build the order using new SDK API
+        let order = retry_with_backoff(
+            "build_limit_order",
             RetryConfig::new(3, 200),
             || async {
-                self.clob.create_and_post_limit_order(
-                    &order,
-                    None,
-                    order_type,
-                ).await
+                self.client
+                    .limit_order()
+                    .token_id(token_id)
+                    .size(Decimal::from_f64(size).unwrap_or(Decimal::ZERO))
+                    .price(Decimal::from_f64(price).unwrap_or(Decimal::ZERO))
+                    .side(side)
+                    .order_type(order_type)
+                    .build()
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+            },
+        ).await?;
+
+        // Sign the order
+        let signed_order = retry_with_backoff(
+            "sign_order",
+            RetryConfig::new(3, 200),
+            || async {
+                self.client.sign(&self.signer, order.clone()).await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+            },
+        ).await?;
+
+        // Post the order
+        let result = retry_with_backoff(
+            "post_order",
+            RetryConfig::new(3, 200),
+            || async {
+                self.client.post_order(signed_order.clone()).await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
             },
         ).await?;
 
         info!("Order placed successfully");
-
-        Ok(result)
+        
+        // Convert result to serde_json::Value
+        let result_json = serde_json::to_value(&result)?;
+        Ok(result_json)
     }
 
     /// Place a limit order (default GTC)
@@ -434,15 +448,27 @@ impl TradeExecutor {
     }
 
     /// Get order book for a token
-    /// Matches Python: get_orderbook()
     pub async fn get_order_book(
         &self,
         token_id: &str,
     ) -> Result<(serde_json::Value, serde_json::Value), Box<dyn std::error::Error>> {
         info!("Getting order book for {}", token_id);
 
-        // Use CLOB client's get_order_book method
-        let book = self.clob.get_order_book(token_id).await?;
+        // Use the new SDK's orderbook endpoint
+        let book = match tokio::time::timeout(
+            Duration::from_secs(10),
+            self.client.get_orderbook(token_id)
+        ).await {
+            Ok(Ok(book)) => book,
+            Ok(Err(e)) => {
+                warn!("Failed to get order book: {}", e);
+                return Err(e.into());
+            }
+            Err(_) => {
+                warn!("Timeout getting order book for {}", token_id);
+                return Err("Timeout".into());
+            }
+        };
 
         let bids = serde_json::to_value(&book.bids)?;
         let asks = serde_json::to_value(&book.asks)?;
@@ -461,28 +487,25 @@ impl TradeExecutor {
             "cancel_all",
             RetryConfig::new(3, 200),
             || async {
-                self.clob.cancel_all().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+                self.client.cancel_all_orders().await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
             }
         ).await?;
 
         info!("All orders cancelled");
 
-        Ok(result)
+        let result_json = serde_json::to_value(&result)?;
+        Ok(result_json)
     }
 
     /// Cancel orders for specific market (by token_id)
-    /// Matches Python: _cancel_orders_for_token()
-    /// 
-    /// CRITICAL FIX: Check for fills before cancelling to avoid double-counting
-    /// - If order is no longer in open orders (but was tracked), it may have filled
-    /// - Update positions for filled orders instead of just cancelling
     pub async fn cancel_orders_for_market(
         &self,
         token_id: &str,
     ) -> Result<CancelOrdersResult, Box<dyn std::error::Error>> {
         info!("Cancelling orders for market {}", token_id);
 
-        // 1. Get open orders for this token (skip if in simulation mode)
+        // 1. Get open orders for this token
         let open_orders = if self.simulation_mode {
             info!("🎮 [SIMULATION] Skipping order cancellation for {}", token_id);
             vec![]
@@ -495,18 +518,12 @@ impl TradeExecutor {
                 }
             }
         };
-        
-        // Create a set of open order IDs for quick lookup
-        let _open_order_ids: std::collections::HashSet<String> = open_orders
-            .iter()
-            .map(|o| o.id.clone())
-            .collect();
 
         if open_orders.is_empty() {
             info!("No open orders to cancel for {}", token_id);
             return Ok(CancelOrdersResult {
                 cancelled: 0,
-                filled_orders: vec![], // All tracked orders may have filled
+                filled_orders: vec![],
             });
         }
 
@@ -516,9 +533,13 @@ impl TradeExecutor {
         // 2. Cancel each order
         let mut cancelled_count = 0;
         for order in open_orders {
-            let id = order.id;
+            let id = order.get("id")
+                .or(order.get("order_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+                
             if !id.is_empty() {
-                match self.cancel_order(&id).await {
+                match self.cancel_order(id).await {
                     Ok(_) => {
                         cancelled_count += 1;
                         info!("Cancelled order {}", id);
@@ -533,12 +554,11 @@ impl TradeExecutor {
         info!("✅ Cancelled {}/{} orders for market {}", cancelled_count, total_orders, token_id);
         Ok(CancelOrdersResult {
             cancelled: cancelled_count,
-            filled_orders: vec![], // TODO: Return actual filled order info
+            filled_orders: vec![],
         })
     }
     
-    /// Get filled orders for a token (orders that are no longer open)
-    /// Used to detect fills before cancelling
+    /// Get filled orders for a token
     pub async fn get_filled_orders(
         &self,
         token_id: &str,
@@ -547,7 +567,8 @@ impl TradeExecutor {
         let open_orders = self.get_open_orders(token_id).await?;
         let open_ids: std::collections::HashSet<String> = open_orders
             .iter()
-            .map(|o| o.id.clone())
+            .filter_map(|o| o.get("id").or(o.get("order_id")).and_then(|v| v.as_str()))
+            .map(|s| s.to_string())
             .collect();
         
         // Orders that were tracked but are no longer open = likely filled
@@ -561,25 +582,22 @@ impl TradeExecutor {
     }
 
     /// Get server time
-    pub async fn get_server_time(&self,
-    ) -> Result<u64, Box<dyn std::error::Error>> {
-        let time = self.clob.get_server_time().await?;
-        Ok(time)
+    pub async fn get_server_time(&self) -> Result<u64, Box<dyn std::error::Error>> {
+        let time = self.client.get_server_time().await?;
+        Ok(time as u64)
     }
 
     /// Get markets
     pub async fn get_markets(
         &self,
-    ) -> Result<Vec<rs_clob_client::Market>, Box<dyn std::error::Error>> {
-        let params = rs_clob_client::MarketParams {
-            limit: Some(500),
-            offset: None,
-            order: None,
-            ascending: None,
-            condition_id: None,
-            closed: None,  // Don't filter by closed status
-        };
-        let markets = self.clob.get_markets(params).await?;
+    ) -> Result<Vec<polymarket_client_sdk::gamma::types::Market>, Box<dyn std::error::Error>> {
+        use polymarket_client_sdk::gamma::Client as GammaClient;
+        use polymarket_client_sdk::gamma::types::request::MarketsRequest;
+        
+        let gamma_client = GammaClient::default();
+        let request = MarketsRequest::builder().limit(500).build();
+        let markets = gamma_client.markets(&request).await?;
+        
         Ok(markets)
     }
 }

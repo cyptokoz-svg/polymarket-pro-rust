@@ -38,8 +38,8 @@ impl MarketInfo {
     }
 }
 
-/// Convert from rs_clob_client::Market to MarketInfo
-pub fn convert_market(market: &rs_clob_client::Market) -> MarketInfo {
+/// Convert from polymarket_client_sdk::gamma::types::Market to MarketInfo
+pub fn convert_market(market: &polymarket_client_sdk::gamma::types::Market) -> MarketInfo {
     let mut tokens = Vec::new();
     
     // Use condition_id as token_id (fallback behavior)
