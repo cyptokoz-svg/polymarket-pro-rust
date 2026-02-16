@@ -164,6 +164,7 @@ impl PositionTracker {
             match pos.side {
                 Side::Buy => up_value += value,
                 Side::Sell => down_value += value,
+                _ => {}, // Handle any future variants
             }
         }
 
@@ -186,6 +187,7 @@ impl PositionTracker {
             match pos.side {
                 Side::Buy => up_value += value,
                 Side::Sell => down_value += value,
+                _ => {}, // Handle any future variants
             }
         }
 
@@ -299,6 +301,7 @@ impl PositionTracker {
                     base_limit * (1.0 + skew)
                 }
             }
+            _ => base_limit, // Handle any future variants
         }
     }
 

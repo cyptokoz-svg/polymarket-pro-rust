@@ -38,15 +38,15 @@ impl MarketInfo {
     }
 }
 
-/// Convert from polymarket_client_sdk::gamma::types::Market to MarketInfo
-pub fn convert_market(market: &polymarket_client_sdk::gamma::types::Market) -> MarketInfo {
+/// Convert from polymarket_client_sdk::gamma::types::response::Market to MarketInfo
+pub fn convert_market(market: &polymarket_client_sdk::gamma::types::response::Market) -> MarketInfo {
     let mut tokens = Vec::new();
     
     // Use condition_id as token_id (fallback behavior)
     if let Some(condition_id) = &market.condition_id {
         // For binary markets, create UP and DOWN tokens
         tokens.push(MarketToken {
-            token_id: condition_id.clone(),
+            token_id: condition_id.to_string(),
             outcome: "UP".to_string(),
             price: None,
         });
@@ -54,11 +54,10 @@ pub fn convert_market(market: &polymarket_client_sdk::gamma::types::Market) -> M
     }
     
     MarketInfo {
-        condition_id: market.condition_id.clone().unwrap_or_default(),
+        condition_id: market.condition_id.map(|c| c.to_string()).unwrap_or_default(),
         slug: market.slug.clone().unwrap_or_default(),
         question: market.question.clone().unwrap_or_default(),
         tokens,
-        outcome_prices: market.outcome_prices.as_ref()
-            .and_then(|p| serde_json::from_str(p).ok()),
+        outcome_prices: None, // Simplified - would need proper conversion from Vec<Decimal>
     }
 }

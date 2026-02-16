@@ -67,7 +67,9 @@ impl PrivateKeyWallet {
 #[async_trait::async_trait]
 impl Wallet for PrivateKeyWallet {
     fn address(&self) -> Address {
-        self.signer.address()
+        // Convert SDK Address to alloy_primitives Address
+        let sdk_addr = self.signer.address();
+        Address::from_slice(sdk_addr.as_slice())
     }
     
     async fn sign_message(&self, message: &[u8]) -> Result<Vec<u8>, WalletError> {
