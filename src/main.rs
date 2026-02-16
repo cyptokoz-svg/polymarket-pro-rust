@@ -471,17 +471,15 @@ async fn run_trading_cycle_single_market(
         warn!("⚠️ WebSocket prices may be stale");
     }
 
-    // Calculate inventory skew for price adjustment
-    let inventory_skew = position_tracker.read().await.calculate_inventory_skew().await;
-    info!("Current inventory skew: {:.2}", inventory_skew);
-
-    // Log inventory status and check position limit in one read lock
-    let (status, should_return) = {
+    // Calculate inventory skew and status once, reuse throughout the function
+    let (inventory_skew, status, should_return) = {
         let tracker = position_tracker.read().await;
+        let skew = tracker.calculate_inventory_skew().await;
         let status = tracker.get_inventory_status().await;
         let should_return = status.total_value >= trading_config.max_total_position;
-        (status, should_return)
+        (skew, status, should_return)
     };
+    info!("Current inventory skew: {:.2}", inventory_skew);
     
     info!("📊 Inventory: UP=${:.2} | DOWN=${:.2} | Total=${:.2} | Skew={:.1}%",
         status.up_value, status.down_value, status.total_value, status.skew * 100.0);
@@ -682,15 +680,45 @@ async fn run_trading_cycle_single_market(
     order_tracker.write().await.clear_orders_for_token(&up_token_id);
     order_tracker.write().await.clear_orders_for_token(&down_token_id);
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // Wait for cancellation to propagate and verify
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    
+    // Verify no open orders remain (with retry)
+    for attempt in 1..=3 {
+        let open_orders_up = executor.get_open_orders().await.unwrap_or_default()
+            .into_iter()
+            .filter(|o| o.get("asset_id").and_then(|v| v.as_str()) == Some(&up_token_id))
+            .count();
+        let open_orders_down = executor.get_open_orders().await.unwrap_or_default()
+            .into_iter()
+            .filter(|o| o.get("asset_id").and_then(|v| v.as_str()) == Some(&down_token_id))
+            .count();
+        
+        if open_orders_up == 0 && open_orders_down == 0 {
+            info!("✅ Verified no open orders remaining");
+            break;
+        }
+        
+        warn!("⚠️ Still have {} UP and {} DOWN open orders (attempt {})", 
+            open_orders_up, open_orders_down, attempt);
+        
+        if attempt == 3 {
+            error!("🛑 Failed to cancel all orders after 3 attempts, stopping cycle");
+            return Ok(());
+        }
+        
+        // Retry cancel
+        let _ = executor.cancel_orders_for_market(&up_token_id).await;
+        let _ = executor.cancel_orders_for_market(&down_token_id).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+    }
 
     // CRITICAL FIX: Recalculate inventory skew after processing fills
     let inventory_skew = position_tracker.read().await.calculate_inventory_skew().await;
     info!("🔄 Recalculated inventory skew after fills: {:.2}", inventory_skew);
 
     // Check skip sides and get position limits for UP and DOWN separately
-    // UP: Buy = Buy UP, Sell = Sell UP
-    // DOWN: Buy = Buy DOWN, Sell = Sell DOWN
+    // Use the already calculated inventory_skew for consistency
     let (
         (skip_buy_up, reason_buy_up),
         (skip_sell_up, reason_sell_up),
@@ -701,8 +729,7 @@ async fn run_trading_cycle_single_market(
         buy_limit_down,
         sell_limit_down,
     ) = {
-        let tracker = position_tracker.read().await;
-        let skew = tracker.calculate_inventory_skew().await;
+        let skew = inventory_skew; // Use the pre-calculated skew
         
         // UP logic: Buy UP when skew is low, Sell UP when skew is high
         let skip_buy_up = skew > 0.7;
