@@ -688,14 +688,89 @@ async fn run_trading_cycle_single_market(
     let inventory_skew = position_tracker.read().await.calculate_inventory_skew().await;
     info!("🔄 Recalculated inventory skew after fills: {:.2}", inventory_skew);
 
-    // Check skip sides and get position limits in one read lock
-    let ((skip_buy_up, reason_buy_up), (skip_sell_up, reason_sell_up), buy_limit_up, sell_limit_up) = {
+    // Check skip sides and get position limits for UP and DOWN separately
+    // UP: Buy = Buy UP, Sell = Sell UP
+    // DOWN: Buy = Buy DOWN, Sell = Sell DOWN
+    let (
+        (skip_buy_up, reason_buy_up),
+        (skip_sell_up, reason_sell_up),
+        (skip_buy_down, reason_buy_down),
+        (skip_sell_down, reason_sell_down),
+        buy_limit_up,
+        sell_limit_up,
+        buy_limit_down,
+        sell_limit_down,
+    ) = {
         let tracker = position_tracker.read().await;
-        let buy_check = tracker.should_skip_side(Side::Buy).await;
-        let sell_check = tracker.should_skip_side(Side::Sell).await;
-        let buy_lim = tracker.get_position_limit(Side::Buy, trading_config.max_position).await;
-        let sell_lim = tracker.get_position_limit(Side::Sell, trading_config.max_position).await;
-        (buy_check, sell_check, buy_lim, sell_lim)
+        let skew = tracker.calculate_inventory_skew().await;
+        
+        // UP logic: Buy UP when skew is low, Sell UP when skew is high
+        let skip_buy_up = skew > 0.7;
+        let reason_buy_up = if skip_buy_up {
+            format!("UP inventory too high ({:.1}%), skip buying UP", skew * 100.0)
+        } else {
+            "OK to buy UP".to_string()
+        };
+        
+        let skip_sell_up = skew < -0.7;
+        let reason_sell_up = if skip_sell_up {
+            format!("DOWN inventory too high ({:.1}%), skip selling UP (would increase UP)", skew.abs() * 100.0)
+        } else {
+            "OK to sell UP".to_string()
+        };
+        
+        // DOWN logic: Buy DOWN when skew is high (negative), Sell DOWN when skew is low (positive)
+        let skip_buy_down = skew < -0.7;
+        let reason_buy_down = if skip_buy_down {
+            format!("DOWN inventory too high ({:.1}%), skip buying DOWN", skew.abs() * 100.0)
+        } else {
+            "OK to buy DOWN".to_string()
+        };
+        
+        let skip_sell_down = skew > 0.7;
+        let reason_sell_down = if skip_sell_down {
+            format!("UP inventory too high ({:.1}%), skip selling DOWN (would increase DOWN)", skew * 100.0)
+        } else {
+            "OK to sell DOWN".to_string()
+        };
+        
+        // Calculate limits based on skew
+        let base_limit = trading_config.max_position / 2.0;
+        
+        let buy_limit_up = if skew > 0.5 {
+            base_limit * (1.0 - skew)  // Stricter when UP high
+        } else {
+            base_limit * (1.0 + skew.abs())  // Looser when UP low
+        };
+        
+        let sell_limit_up = if skew < -0.5 {
+            base_limit * (1.0 - skew.abs())  // Stricter when DOWN high (selling UP increases UP)
+        } else {
+            base_limit * (1.0 + skew)  // Looser when DOWN low
+        };
+        
+        let buy_limit_down = if skew < -0.5 {
+            base_limit * (1.0 - skew.abs())  // Stricter when DOWN high
+        } else {
+            base_limit * (1.0 + skew.abs())  // Looser when DOWN low
+        };
+        
+        let sell_limit_down = if skew > 0.5 {
+            base_limit * (1.0 - skew)  // Stricter when UP high (selling DOWN increases DOWN)
+        } else {
+            base_limit * (1.0 + skew.abs())  // Looser when UP low
+        };
+        
+        (
+            (skip_buy_up, reason_buy_up),
+            (skip_sell_up, reason_sell_up),
+            (skip_buy_down, reason_buy_down),
+            (skip_sell_down, reason_sell_down),
+            buy_limit_up,
+            sell_limit_up,
+            buy_limit_down,
+            sell_limit_down,
+        )
     };
     
     if skip_buy_up {
@@ -704,6 +779,14 @@ async fn run_trading_cycle_single_market(
     
     if skip_sell_up {
         info!("Skipping Sell for UP {}: {}", up_token_id, reason_sell_up);
+    }
+    
+    if skip_buy_down {
+        info!("Skipping Buy for DOWN {}: {}", down_token_id, reason_buy_down);
+    }
+    
+    if skip_sell_down {
+        info!("Skipping Sell for DOWN {}: {}", down_token_id, reason_sell_down);
     }
 
     // Calculate prices with spread adjustment based on inventory skew
@@ -774,8 +857,8 @@ async fn run_trading_cycle_single_market(
 
     // Place DOWN buy order (betting DOWN will go up = UP will go down)
     let down_buy_task = async {
-        if !skip_buy_up {
-            let size = trading_config.order_size.min(buy_limit_up);
+        if !skip_buy_down {
+            let size = trading_config.order_size.min(buy_limit_down);
             place_side_order(
                 &executor,
                 &order_tracker,
@@ -796,8 +879,8 @@ async fn run_trading_cycle_single_market(
 
     // Place DOWN sell order
     let down_sell_task = async {
-        if !skip_sell_up {
-            let size = trading_config.order_size.min(sell_limit_up);
+        if !skip_sell_down {
+            let size = trading_config.order_size.min(sell_limit_down);
             place_side_order(
                 &executor,
                 &order_tracker,

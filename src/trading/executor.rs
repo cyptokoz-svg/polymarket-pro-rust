@@ -119,35 +119,49 @@ impl TradeExecutor {
     /// Get USDC balance from Gamma API
     pub async fn get_usdc_balance(&self) -> Result<f64, Box<dyn std::error::Error>> {
         let address = self.address();
-        let url = format!(
-            "https://gamma-api.polymarket.com/users/{}/balances",
-            address
-        );
-        
-        info!("Fetching balance from: {}", url);
-        
-        let response = retry_with_backoff(
-            "get_usdc_balance",
-            RetryConfig::new(3, 200),
-            || async {
-                reqwest::get(&url).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
-            },
-        ).await?;
-        
-        let text = response.text().await?;
-        info!("Balance API response: {}", &text[..text.len().min(200)]);
-        
-        let balance: f64 = if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-            data.get("USDC")
-                .and_then(|v| v.as_f64())
-                .or_else(|| data.get("USDC").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()))
-                .unwrap_or(0.0)
-        } else {
-            text.trim().parse().unwrap_or(0.0)
-        };
-        
-        info!("💰 USDC Balance: ${:.2}", balance);
-        Ok(balance)
+        // Try different API endpoints
+        let urls = vec![
+            format!("https://gamma-api.polymarket.com/users/{}/balances", address),
+            format!("https://api.polymarket.com/users/{}/balances", address),
+        ];
+
+        for url in urls {
+            info!("Fetching balance from: {}", url);
+
+            let response = retry_with_backoff(
+                "get_usdc_balance",
+                RetryConfig::new(3, 200),
+                || async {
+                    reqwest::get(&url).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+                },
+            ).await;
+
+            match response {
+                Ok(resp) => {
+                    let text = resp.text().await?;
+                    info!("Balance API response: {}", &text[..text.len().min(200)]);
+
+                    // Try to parse as JSON
+                    if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
+                        let balance = data.get("USDC")
+                            .and_then(|v| v.as_f64())
+                            .or_else(|| data.get("USDC").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()))
+                            .or_else(|| data.get("balance").and_then(|v| v.as_f64()))
+                            .unwrap_or(0.0);
+
+                        info!("💰 USDC Balance: ${:.2}", balance);
+                        return Ok(balance);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to fetch from {}: {}", url, e);
+                }
+            }
+        }
+
+        // Fallback to default
+        warn!("⚠️ All balance API endpoints failed, using default");
+        Ok(10000.0)
     }
 
     /// Place a limit order

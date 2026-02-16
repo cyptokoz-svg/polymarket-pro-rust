@@ -1,7 +1,7 @@
 //! BTC 5-minute market finder - Simplified version
 
 use polymarket_pro::trading::TradeExecutor;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Find BTC up/down 5-minute market by time slot
 /// Simplified implementation using JSON directly
