@@ -1,0 +1,29 @@
+[Unit]
+Description=Polymarket Pro Trading Bot
+After=network.target
+
+[Service]
+Type=simple
+User=%I
+WorkingDirectory=/root/.openclaw/workspace/polymarket-pro-rust
+ExecStart=/root/.openclaw/workspace/polymarket-pro-rust/target/release/polymarket-pro
+Restart=always
+RestartSec=10
+
+# Environment variables (set these in your shell or use EnvironmentFile)
+Environment="RUST_LOG=info"
+# Environment="PK=0x..."
+# Environment="SAFE_ADDRESS=0x..."
+# Environment="BROWSER_ADDRESS=0x..."
+# Environment="POLY_BUILDER_API_KEY=..."
+# Environment="POLY_BUILDER_API_SECRET=..."
+# Environment="POLY_BUILDER_API_PASSPHRASE=..."
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/tmp
+
+[Install]
+WantedBy=multi-user.target

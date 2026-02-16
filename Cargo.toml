@@ -1,0 +1,80 @@
+[package]
+name = "polymarket-pro"
+version = "0.1.0"
+edition = "2021"
+authors = ["Polymarket Pro Team"]
+description = "High-performance Polymarket trading bot in Rust"
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full", "rt-multi-thread"] }
+tokio-util = "0.7"
+
+# HTTP client
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+
+# WebSocket
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+futures = "0.3"
+
+# Polymarket CLOB client - 核心依赖
+rs-clob-client = "0.1"
+
+# Alloy ecosystem (与 rs-clob-client 兼容)
+alloy-signer = "0.5"
+alloy-signer-local = "0.5"
+alloy-primitives = "0.8"
+alloy-sol-types = "0.8"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Utilities
+uuid = { version = "1.6", features = ["v4", "serde"] }
+hex = "0.4"
+rand = { version = "0.8", features = ["getrandom"] }
+
+# Async trait
+async-trait = "0.1"
+
+# Testing
+tokio-test = "0.4"
+wiremock = "0.6"
+mockall = "0.12"
+config = "0.15.19"
+serde_yaml = "0.9.34"
+dirs = "6.0.0"
+toml = "1.0.1"
+
+[dev-dependencies]
+# Additional test utilities
+pretty_assertions = "1.4"
+tempfile = "3.9"
+
+[[bin]]
+name = "polymarket-pro"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true

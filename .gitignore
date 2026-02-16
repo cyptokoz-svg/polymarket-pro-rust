@@ -1,0 +1,16 @@
+/target
+.env
+*.log
+/tmp
+/check_addr
+/check_address.rs
+CONFIG_SUMMARY.md
+FILL_DETECTION_FIX.md
+FINAL_CHECK.md
+/test_logs
+*.pid
+nohup.out
+.DS_Store
+*.swp
+*.swo
+*~
