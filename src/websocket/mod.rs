@@ -227,7 +227,7 @@ impl PolymarketWebSocket {
         // Update tokens
         {
             let mut tokens = self.subscribed_tokens.write().await;
-            *tokens = token_ids;
+            *tokens = token_ids.clone();
         }
         
         // Clear old prices (like Python)
@@ -237,13 +237,35 @@ impl PolymarketWebSocket {
             info!("🧹 Cleared old price cache for new market");
         }
         
-        // Restart connection
+        // Restart connection - MUST spawn new task
         {
             let mut running = self.running.write().await;
             *running = true;
         }
         
-        info!("✅ WebSocket restart scheduled for new subscription");
+        // Clone Arc for new task
+        let subscribed_tokens = self.subscribed_tokens.clone();
+        let last_prices = self.last_prices.clone();
+        let msg_counter = self.msg_counter.clone();
+        let running = self.running.clone();
+        let last_display_time = self.last_display_time.clone();
+        let messages_received = self.messages_received.clone();
+        let token_labels = self.token_labels.clone();
+        
+        // Spawn new connection task - CRITICAL FIX
+        tokio::spawn(async move {
+            Self::connect_market(
+                subscribed_tokens,
+                last_prices,
+                msg_counter,
+                running,
+                last_display_time,
+                messages_received,
+                token_labels,
+            ).await;
+        });
+        
+        info!("✅ WebSocket restarted with {} markets", token_ids.len());
     }
 
     /// 获取最新价格
