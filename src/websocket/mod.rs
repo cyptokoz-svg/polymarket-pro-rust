@@ -591,11 +591,18 @@ impl PolymarketWebSocket {
             // Best ask = 最低价格（卖盘）
             let best_ask = prices_sizes[prices_sizes.len() - 1].0;
 
-            // 更新缓存
+            // 更新缓存 - 使用短 token_id 作为 key（与其他地方一致）
             {
                 let mut prices = last_prices.write().await;
-                prices.insert(format!("{}_bid", token_id), best_bid);
-                prices.insert(format!("{}_ask", token_id), best_ask);
+                let short_token_id: String = if token_id.len() > 20 {
+                    token_id[..20].to_string()
+                } else {
+                    token_id.to_string()
+                };
+                prices.insert(format!("{}_bid", short_token_id), best_bid);
+                prices.insert(format!("{}_ask", short_token_id), best_ask);
+                info!("DEBUG storing: key={}, bid={}", short_token_id, best_bid);
+                info!("DEBUG storing: key={}, ask={}", short_token_id, best_ask);
             }
 
             // 每 5 秒打印一次
