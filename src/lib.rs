@@ -25,6 +25,7 @@ pub use trading::{
     OrderTracker, ActiveOrder, FillStatus, wait_for_fill,
     TradeHistory, TradeRecord,
     TradingStats, PriceFreshness,
+    ScoreGrade, MarketScore, PerformanceScore, RiskScore, CompositeScore,
 };
 pub use wallet::{PrivateKeyWallet, SafeWallet, Wallet, RedeemTypedData};
 pub use websocket::{PolymarketWebSocket, PriceUpdate};
