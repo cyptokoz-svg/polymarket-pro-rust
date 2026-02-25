@@ -25,7 +25,7 @@ pub enum ScoreGrade {
 
 impl ScoreGrade {
     pub fn from_score(score: f64) -> Self {
-        match score as u32 {
+        match score.round() as u32 {
             80..=100 => Self::Excellent,
             60..=79 => Self::Good,
             40..=59 => Self::Fair,
