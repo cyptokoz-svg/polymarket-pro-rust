@@ -14,6 +14,7 @@ pub mod price_warning;
 pub mod errors;
 pub mod exit_manager;
 pub mod callbacks;
+pub mod scoring;
 
 pub use market_maker::{MarketMaker, MarketMakerConfig};
 pub use position::{PositionTracker, Position, PositionEntry, InventoryStatus, Action, BalanceAdjustment};
@@ -28,4 +29,5 @@ pub use price_warning::PriceWarningTracker;
 pub use errors::{TradingError, classify_error};
 pub use exit_manager::{ExitManager, PositionExitTracker, TrackedPosition, ExitCheck};
 pub use callbacks::{CallbackManager, OrderInfo};
+pub use scoring::{ScoreGrade, MarketScore, PerformanceScore, RiskScore, CompositeScore};
 

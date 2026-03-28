@@ -1,0 +1,725 @@
+From 901ff673563c6dbc15dde4b51e1ee1578ff90a77 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 25 Feb 2026 11:36:02 +0000
+Subject: [PATCH] feat: add real-time WebSocket streaming support (ws command)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add `polymarket ws` command with four subcommands:
+- `ws book <asset_ids>` — stream CLOB order book updates
+- `ws trades` — stream live trade activity via RTDS
+- `ws prices <symbols>` — stream crypto price updates via RTDS
+- `ws user` — stream user-specific events (authenticated)
+
+Features auto-reconnect, ping/pong keepalive, table and JSON output,
+and graceful Ctrl-C shutdown.
+
+https://claude.ai/code/session_01Ugwh5T4A9z5jokkHuDvLDe
+---
+ Cargo.lock          |  88 +++++++++++++++-
+ Cargo.toml          |   7 +-
+ src/commands/mod.rs |   1 +
+ src/commands/ws.rs  | 241 ++++++++++++++++++++++++++++++++++++++++++++
+ src/main.rs         |   4 +
+ src/websocket.rs    | 191 +++++++++++++++++++++++++++++++++++
+ 6 files changed, 527 insertions(+), 5 deletions(-)
+ create mode 100644 src/commands/ws.rs
+ create mode 100644 src/websocket.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 26a3032..b642eb0 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1524,6 +1524,12 @@ dependencies = [
+  "parking_lot_core",
+ ]
+ 
++[[package]]
++name = "data-encoding"
++version = "2.10.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
++
+ [[package]]
+ name = "der"
+ version = "0.7.10"
+@@ -1798,7 +1804,7 @@ checksum = "0ce92ff622d6dadf7349484f42c93271a0d49b7cc4d466a936405bacbe10aa78"
+ dependencies = [
+  "cfg-if",
+  "rustix",
+- "windows-sys 0.52.0",
++ "windows-sys 0.59.0",
+ ]
+ 
+ [[package]]
+@@ -2221,7 +2227,7 @@ dependencies = [
+  "tokio",
+  "tokio-rustls",
+  "tower-service",
+- "webpki-roots",
++ "webpki-roots 1.0.6",
+ ]
+ 
+ [[package]]
+@@ -2974,6 +2980,7 @@ dependencies = [
+  "chrono",
+  "clap",
+  "dirs",
++ "futures-util",
+  "polymarket-client-sdk",
+  "predicates",
+  "rust_decimal",
+@@ -2983,6 +2990,8 @@ dependencies = [
+  "serde_json",
+  "tabled",
+  "tokio",
++ "tokio-tungstenite",
++ "url",
+ ]
+ 
+ [[package]]
+@@ -3457,7 +3466,7 @@ dependencies = [
+  "wasm-bindgen",
+  "wasm-bindgen-futures",
+  "web-sys",
+- "webpki-roots",
++ "webpki-roots 1.0.6",
+ ]
+ 
+ [[package]]
+@@ -4056,6 +4065,17 @@ dependencies = [
+  "serde",
+ ]
+ 
++[[package]]
++name = "sha1"
++version = "0.10.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
++dependencies = [
++ "cfg-if",
++ "cpufeatures",
++ "digest 0.10.7",
++]
++
+ [[package]]
+ name = "sha2"
+ version = "0.10.9"
+@@ -4093,6 +4113,16 @@ version = "1.3.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
+ 
++[[package]]
++name = "signal-hook-registry"
++version = "1.4.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
++dependencies = [
++ "errno",
++ "libc",
++]
++
+ [[package]]
+ name = "signature"
+ version = "2.2.0"
+@@ -4433,6 +4463,7 @@ dependencies = [
+  "libc",
+  "mio",
+  "pin-project-lite",
++ "signal-hook-registry",
+  "socket2",
+  "tokio-macros",
+  "windows-sys 0.61.2",
+@@ -4471,6 +4502,22 @@ dependencies = [
+  "tokio-util",
+ ]
+ 
++[[package]]
++name = "tokio-tungstenite"
++version = "0.24.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "edc5f74e248dc973e0dbb7b74c7e0d6fcc301c694ff50049504004ef4d0cdcd9"
++dependencies = [
++ "futures-util",
++ "log",
++ "rustls",
++ "rustls-pki-types",
++ "tokio",
++ "tokio-rustls",
++ "tungstenite",
++ "webpki-roots 0.26.11",
++]
++
+ [[package]]
+ name = "tokio-util"
+ version = "0.7.18"
+@@ -4596,6 +4643,26 @@ version = "0.2.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+ 
++[[package]]
++name = "tungstenite"
++version = "0.24.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "18e5b8366ee7a95b16d32197d0b2604b43a0be89dc5fac9f8e96ccafbaedda8a"
++dependencies = [
++ "byteorder",
++ "bytes",
++ "data-encoding",
++ "http",
++ "httparse",
++ "log",
++ "rand 0.8.5",
++ "rustls",
++ "rustls-pki-types",
++ "sha1",
++ "thiserror 1.0.69",
++ "utf-8",
++]
++
+ [[package]]
+ name = "typenum"
+ version = "1.19.0"
+@@ -4669,6 +4736,12 @@ dependencies = [
+  "serde_derive",
+ ]
+ 
++[[package]]
++name = "utf-8"
++version = "0.7.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
++
+ [[package]]
+ name = "utf8_iter"
+ version = "1.0.4"
+@@ -4893,6 +4966,15 @@ dependencies = [
+  "rustls-pki-types",
+ ]
+ 
++[[package]]
++name = "webpki-roots"
++version = "0.26.11"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
++dependencies = [
++ "webpki-roots 1.0.6",
++]
++
+ [[package]]
+ name = "webpki-roots"
+ version = "1.0.6"
+diff --git a/Cargo.toml b/Cargo.toml
+index a01bf05..477ccc3 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -16,8 +16,8 @@ path = "src/main.rs"
+ [dependencies]
+ polymarket-client-sdk = { version = "0.4", features = ["gamma", "data", "bridge", "clob", "ctf"] }
+ alloy = { version = "1.6.3", default-features = false, features = ["providers", "sol-types", "contract", "reqwest", "reqwest-rustls-tls", "signer-local", "signers"] }
+-clap = { version = "4", features = ["derive"] }
+-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
++clap = { version = "4", features = ["derive", "env"] }
++tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+ serde_json = "1"
+ serde = { version = "1", features = ["derive"] }
+ tabled = "0.17"
+@@ -26,6 +26,9 @@ anyhow = "1"
+ chrono = "0.4"
+ dirs = "6"
+ rustyline = "15"
++tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
++futures-util = "0.3"
++url = "2"
+ 
+ [dev-dependencies]
+ assert_cmd = "2"
+diff --git a/src/commands/mod.rs b/src/commands/mod.rs
+index 671c0ee..eec95c8 100644
+--- a/src/commands/mod.rs
++++ b/src/commands/mod.rs
+@@ -15,6 +15,7 @@ pub mod sports;
+ pub mod tags;
+ pub mod upgrade;
+ pub mod wallet;
++pub mod ws;
+ 
+ pub fn is_numeric_id(id: &str) -> bool {
+     !id.is_empty() && id.chars().all(|c| c.is_ascii_digit())
+diff --git a/src/commands/ws.rs b/src/commands/ws.rs
+new file mode 100644
+index 0000000..6afb784
+--- /dev/null
++++ b/src/commands/ws.rs
+@@ -0,0 +1,241 @@
++use anyhow::Result;
++use clap::{Args, Subcommand};
++
++use crate::output::OutputFormat;
++use crate::websocket;
++
++#[derive(Args)]
++pub struct WsArgs {
++    #[command(subcommand)]
++    pub command: WsCommand,
++}
++
++#[derive(Subcommand)]
++pub enum WsCommand {
++    /// Stream real-time order book updates for one or more assets
++    Book {
++        /// Asset (token) IDs to subscribe to
++        #[arg(required = true, num_args = 1..)]
++        asset_ids: Vec<String>,
++    },
++
++    /// Stream real-time trade activity (via RTDS)
++    Trades {
++        /// Optional: filter by event slug
++        #[arg(long)]
++        event_slug: Option<String>,
++        /// Optional: filter by market slug
++        #[arg(long)]
++        market_slug: Option<String>,
++    },
++
++    /// Stream real-time crypto price updates (via RTDS)
++    Prices {
++        /// Crypto symbols to track (e.g. BTC, ETH)
++        #[arg(required = true, num_args = 1..)]
++        symbols: Vec<String>,
++    },
++
++    /// Stream user-specific order/trade updates (requires API keys)
++    User {
++        /// CLOB API key
++        #[arg(long, env = "POLYMARKET_CLOB_API_KEY")]
++        api_key: String,
++        /// CLOB API secret
++        #[arg(long, env = "POLYMARKET_CLOB_API_SECRET")]
++        api_secret: String,
++        /// CLOB API passphrase
++        #[arg(long, env = "POLYMARKET_CLOB_API_PASSPHRASE")]
++        api_passphrase: String,
++    },
++}
++
++pub async fn execute(args: WsArgs, output: OutputFormat) -> Result<()> {
++    match args.command {
++        WsCommand::Book { asset_ids } => {
++            let count = asset_ids.len();
++            print_header(&output, &format!("Streaming order book for {count} asset(s)…"));
++
++            websocket::stream_clob_market(asset_ids, |text| {
++                print_ws_event(text, &output);
++            })
++            .await
++        }
++
++        WsCommand::Trades {
++            event_slug,
++            market_slug,
++        } => {
++            print_header(&output, "Streaming live trades…");
++
++            let filters = match (&event_slug, &market_slug) {
++                (Some(slug), _) => Some(format!(r#"{{"event_slug":"{slug}"}}"#)),
++                (_, Some(slug)) => Some(format!(r#"{{"market_slug":"{slug}"}}"#)),
++                _ => None,
++            };
++
++            let topic = websocket::RtdsTopic {
++                topic: "activity".into(),
++                event_type: "trades".into(),
++                filters,
++            };
++
++            websocket::stream_rtds(vec![topic], |text| {
++                print_ws_event(text, &output);
++            })
++            .await
++        }
++
++        WsCommand::Prices { symbols } => {
++            let label = symbols.join(", ");
++            print_header(&output, &format!("Streaming crypto prices: {label}…"));
++
++            let topics: Vec<_> = symbols
++                .into_iter()
++                .map(|sym| websocket::RtdsTopic {
++                    topic: "crypto_prices".into(),
++                    event_type: "update".into(),
++                    filters: Some(format!(r#"{{"symbol":"{sym}"}}"#)),
++                })
++                .collect();
++
++            websocket::stream_rtds(topics, |text| {
++                print_ws_event(text, &output);
++            })
++            .await
++        }
++
++        WsCommand::User {
++            api_key,
++            api_secret,
++            api_passphrase,
++        } => {
++            print_header(&output, "Streaming user events…");
++
++            websocket::stream_clob_user(&api_key, &api_secret, &api_passphrase, |text| {
++                print_ws_event(text, &output);
++            })
++            .await
++        }
++    }
++}
++
++fn print_header(output: &OutputFormat, msg: &str) {
++    match output {
++        OutputFormat::Table => eprintln!("{msg}  (Ctrl-C to stop)"),
++        OutputFormat::Json => {}
++    }
++}
++
++fn print_ws_event(text: &str, output: &OutputFormat) {
++    match output {
++        OutputFormat::Json => {
++            // Pass through raw JSON — one object per line (JSONL).
++            println!("{text}");
++        }
++        OutputFormat::Table => {
++            // Try to pretty-print; fall back to raw text.
++            if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
++                print_table_event(&val);
++            } else {
++                println!("{text}");
++            }
++        }
++    }
++}
++
++fn print_table_event(val: &serde_json::Value) {
++    let event_type = val
++        .get("event_type")
++        .or_else(|| val.get("type"))
++        .and_then(|v| v.as_str())
++        .unwrap_or("event");
++
++    let ts = val
++        .get("timestamp")
++        .and_then(|v| v.as_str().or_else(|| v.as_i64().map(|_| "")))
++        .unwrap_or("");
++
++    match event_type {
++        "price_change" => {
++            let asset = val
++                .get("asset_id")
++                .and_then(|v| v.as_str())
++                .map(|s| &s[..s.len().min(12)])
++                .unwrap_or("?");
++            if let Some(changes) = val.get("changes").and_then(|c| c.as_array()) {
++                for ch in changes {
++                    let price = ch.get("price").and_then(|v| v.as_str()).unwrap_or("?");
++                    let side = ch.get("side").and_then(|v| v.as_str()).unwrap_or("?");
++                    let size = ch.get("size").and_then(|v| v.as_str()).unwrap_or("?");
++                    println!("[price_change] {asset}… | {side} {size} @ {price} | ts={ts}");
++                }
++            }
++        }
++        "book" => {
++            let asset = val
++                .get("asset_id")
++                .and_then(|v| v.as_str())
++                .map(|s| &s[..s.len().min(12)])
++                .unwrap_or("?");
++            let bids = val
++                .get("bids")
++                .and_then(|v| v.as_array())
++                .map(|a| a.len())
++                .unwrap_or(0);
++            let asks = val
++                .get("asks")
++                .and_then(|v| v.as_array())
++                .map(|a| a.len())
++                .unwrap_or(0);
++            println!("[book] {asset}… | bids={bids} asks={asks} | ts={ts}");
++        }
++        "last_trade_price" => {
++            let asset = val
++                .get("asset_id")
++                .and_then(|v| v.as_str())
++                .map(|s| &s[..s.len().min(12)])
++                .unwrap_or("?");
++            let price = val.get("price").and_then(|v| v.as_str()).unwrap_or("?");
++            println!("[last_trade] {asset}… | price={price} | ts={ts}");
++        }
++        "trades" => {
++            let price = val
++                .get("payload")
++                .and_then(|p| p.get("price"))
++                .and_then(|v| v.as_str())
++                .unwrap_or("?");
++            let side = val
++                .get("payload")
++                .and_then(|p| p.get("side"))
++                .and_then(|v| v.as_str())
++                .unwrap_or("?");
++            let size = val
++                .get("payload")
++                .and_then(|p| p.get("size"))
++                .and_then(|v| v.as_str())
++                .unwrap_or("?");
++            println!("[trade] {side} {size} @ {price}");
++        }
++        "update" => {
++            let symbol = val
++                .get("payload")
++                .and_then(|p| p.get("symbol"))
++                .and_then(|v| v.as_str())
++                .unwrap_or("?");
++            let value = val
++                .get("payload")
++                .and_then(|p| p.get("value"))
++                .and_then(|v| v.as_f64())
++                .map(|v| format!("{v:.2}"))
++                .unwrap_or_else(|| "?".into());
++            println!("[price] {symbol} = ${value}");
++        }
++        _ => {
++            // Generic fallback.
++            if let Ok(pretty) = serde_json::to_string_pretty(val) {
++                println!("{pretty}");
++            }
++        }
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index 61af087..abdebbe 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -3,6 +3,7 @@ mod commands;
+ mod config;
+ mod output;
+ mod shell;
++mod websocket;
+ 
+ use std::process::ExitCode;
+ 
+@@ -60,6 +61,8 @@ enum Commands {
+     Bridge(commands::bridge::BridgeArgs),
+     /// Manage wallet and authentication
+     Wallet(commands::wallet::WalletArgs),
++    /// Real-time WebSocket streams (order book, trades, prices)
++    Ws(commands::ws::WsArgs),
+     /// Check API health status
+     Status,
+     /// Update to the latest version
+@@ -184,6 +187,7 @@ pub(crate) async fn run(cli: Cli) -> anyhow::Result<()> {
+         Commands::Wallet(args) => {
+             commands::wallet::execute(args, &cli.output, cli.private_key.as_deref())
+         }
++        Commands::Ws(args) => commands::ws::execute(args, cli.output).await,
+         Commands::Upgrade => commands::upgrade::execute(),
+         Commands::Status => {
+             let status = polymarket_client_sdk::gamma::Client::default()
+diff --git a/src/websocket.rs b/src/websocket.rs
+new file mode 100644
+index 0000000..45f591a
+--- /dev/null
++++ b/src/websocket.rs
+@@ -0,0 +1,191 @@
++use std::time::Duration;
++
++use anyhow::{Context, Result};
++use futures_util::{SinkExt, StreamExt};
++use serde::Serialize;
++use tokio::time;
++use tokio_tungstenite::connect_async;
++use tokio_tungstenite::tungstenite::Message;
++
++const CLOB_WS_MARKET: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
++const CLOB_WS_USER: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/user";
++const RTDS_WS: &str = "wss://ws-live-data.polymarket.com";
++
++const PING_INTERVAL: Duration = Duration::from_secs(10);
++const RECONNECT_DELAY: Duration = Duration::from_secs(3);
++const MAX_RECONNECTS: u32 = 10;
++
++// ---------------------------------------------------------------------------
++// CLOB Market Channel
++// ---------------------------------------------------------------------------
++
++#[derive(Debug, Serialize)]
++pub struct ClobSubscription {
++    pub assets_ids: Vec<String>,
++    #[serde(rename = "type")]
++    pub channel_type: String,
++}
++
++/// Connect to the CLOB Market WebSocket and stream events for the given asset
++/// IDs. Calls `on_event` for every received message. Automatically reconnects
++/// on disconnect.
++pub async fn stream_clob_market(
++    asset_ids: Vec<String>,
++    mut on_event: impl FnMut(&str),
++) -> Result<()> {
++    let sub = ClobSubscription {
++        assets_ids: asset_ids.clone(),
++        channel_type: "market".into(),
++    };
++    let sub_msg = serde_json::to_string(&sub)?;
++    let mut reconnects = 0u32;
++
++    loop {
++        match connect_and_stream(CLOB_WS_MARKET, &sub_msg, &mut on_event).await {
++            Ok(()) => break Ok(()),
++            Err(e) => {
++                reconnects += 1;
++                if reconnects > MAX_RECONNECTS {
++                    break Err(e).context("max reconnects exceeded");
++                }
++                eprintln!("[ws] disconnected: {e}, reconnecting ({reconnects}/{MAX_RECONNECTS})…");
++                time::sleep(RECONNECT_DELAY).await;
++            }
++        }
++    }
++}
++
++/// Connect to the CLOB User WebSocket (requires API key auth header).
++pub async fn stream_clob_user(
++    api_key: &str,
++    api_secret: &str,
++    api_passphrase: &str,
++    mut on_event: impl FnMut(&str),
++) -> Result<()> {
++    let sub = serde_json::json!({
++        "auth": {
++            "apiKey": api_key,
++            "secret": api_secret,
++            "passphrase": api_passphrase,
++        },
++        "type": "user",
++    });
++    let sub_msg = serde_json::to_string(&sub)?;
++    let mut reconnects = 0u32;
++
++    loop {
++        match connect_and_stream(CLOB_WS_USER, &sub_msg, &mut on_event).await {
++            Ok(()) => break Ok(()),
++            Err(e) => {
++                reconnects += 1;
++                if reconnects > MAX_RECONNECTS {
++                    break Err(e).context("max reconnects exceeded");
++                }
++                eprintln!("[ws] disconnected: {e}, reconnecting ({reconnects}/{MAX_RECONNECTS})…");
++                time::sleep(RECONNECT_DELAY).await;
++            }
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// RTDS (Real-Time Data Socket)
++// ---------------------------------------------------------------------------
++
++#[derive(Debug, Serialize)]
++pub struct RtdsSubscription {
++    pub subscriptions: Vec<RtdsTopic>,
++}
++
++#[derive(Debug, Serialize)]
++pub struct RtdsTopic {
++    pub topic: String,
++    #[serde(rename = "type")]
++    pub event_type: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub filters: Option<String>,
++}
++
++/// Connect to the RTDS WebSocket. Subscribes to the given topics and streams
++/// events.
++pub async fn stream_rtds(
++    topics: Vec<RtdsTopic>,
++    mut on_event: impl FnMut(&str),
++) -> Result<()> {
++    let sub = RtdsSubscription {
++        subscriptions: topics,
++    };
++    let sub_msg = serde_json::to_string(&sub)?;
++    let mut reconnects = 0u32;
++
++    loop {
++        match connect_and_stream(RTDS_WS, &sub_msg, &mut on_event).await {
++            Ok(()) => break Ok(()),
++            Err(e) => {
++                reconnects += 1;
++                if reconnects > MAX_RECONNECTS {
++                    break Err(e).context("max reconnects exceeded");
++                }
++                eprintln!("[ws] disconnected: {e}, reconnecting ({reconnects}/{MAX_RECONNECTS})…");
++                time::sleep(RECONNECT_DELAY).await;
++            }
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Shared helper
++// ---------------------------------------------------------------------------
++
++async fn connect_and_stream(
++    url: &str,
++    subscribe_msg: &str,
++    on_event: &mut impl FnMut(&str),
++) -> Result<()> {
++    let (ws, _resp) = connect_async(url)
++        .await
++        .context("failed to connect to WebSocket")?;
++
++    let (mut sink, mut stream) = ws.split();
++
++    // Send subscription message.
++    sink.send(Message::Text(subscribe_msg.into()))
++        .await
++        .context("failed to send subscribe")?;
++
++    let mut ping_interval = time::interval(PING_INTERVAL);
++
++    loop {
++        tokio::select! {
++            _ = ping_interval.tick() => {
++                sink.send(Message::Ping(vec![].into())).await.ok();
++            }
++            msg = stream.next() => {
++                match msg {
++                    Some(Ok(Message::Text(text))) => {
++                        on_event(&text);
++                    }
++                    Some(Ok(Message::Ping(data))) => {
++                        sink.send(Message::Pong(data)).await.ok();
++                    }
++                    Some(Ok(Message::Pong(_))) => {}
++                    Some(Ok(Message::Close(_))) => {
++                        break;
++                    }
++                    Some(Err(e)) => {
++                        return Err(e).context("WebSocket read error");
++                    }
++                    None => break,
++                    _ => {}
++                }
++            }
++            // Ctrl-C graceful shutdown.
++            _ = tokio::signal::ctrl_c() => {
++                sink.send(Message::Close(None)).await.ok();
++                return Ok(());
++            }
++        }
++    }
++
++    anyhow::bail!("WebSocket connection closed by server")
++}
+-- 
+2.43.0
+
